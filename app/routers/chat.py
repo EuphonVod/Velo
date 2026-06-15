@@ -56,7 +56,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                 )
                 db.add(new_message)
                 await db.commit()
+                await db.refresh(new_message)
+                new_id = new_message.id
             await manager.send_to_user(int(receiver_id), f"{user_id}:{message}")
+            await manager.send_to_user(user_id, f"[NEWID]{new_id}|{message}")
     except Exception as e:
         print(f"Erreur: {e}")
         await _update_last_seen(user_id)
