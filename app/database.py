@@ -10,6 +10,7 @@ from app.models.friendship import Friendship
 from app.models.group import Group, GroupMember, GroupMessage
 from app.models.group import Group, GroupMember, GroupMessage, GroupInvite
 from app.models.group import Group, GroupMember, GroupMessage, GroupInvite, GroupBan
+from app.models.conversation import ConversationSettings
 
 #load la file en .env
 load_dotenv()

@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
 from app.dependencies import get_db
 from fastapi import APIRouter, WebSocket, Depends
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime
 
@@ -18,6 +18,7 @@ import os
 import uuid
 from fastapi import UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
+
 
 router = APIRouter()
 
@@ -149,6 +150,22 @@ async def get_file(filename: str):
     if not os.path.exists(path):
         raise HTTPException(404, "Not found")
     return FileResponse(path)
+
+@router.get("/conversation/{other_user_id}")
+async def get_conversation(
+    other_user_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    result = await db.execute(
+        select(Message).where(
+            or_(
+                and_(Message.sender_id == current_user.id, Message.receiver_id == other_user_id),
+                and_(Message.sender_id == other_user_id, Message.receiver_id == current_user.id),
+            )
+        ).order_by(Message.created_at)
+    )
+    return result.scalars().all()
 
 
 #gestionnaire de connexion

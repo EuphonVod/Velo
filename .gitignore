@@ -3,3 +3,6 @@ venv/
 __pycache__/
 .idea/
 uploads_files/
+audio_config.json
+gif_favorites.json
+test.py

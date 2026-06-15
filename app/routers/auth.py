@@ -4,10 +4,11 @@ import bcrypt
 from app.database import AsyncSessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user import User
-from sqlalchemy import select
+from sqlalchemy import select, or_
 from app.dependencies import get_current_user
 import jwt
 import os
+
 
 router = APIRouter()
 
@@ -48,7 +49,13 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=Token)
 async def login(user: UserLogin, db: AsyncSession = Depends(get_db)):
-    result_user = await db.execute(select(User).where(User.email == user.email))
+    # Accepte email OU username via le champ "identifier"
+    identifier = (user.identifier or user.email or "").strip()
+    result_user = await db.execute(
+        select(User).where(
+            or_(User.email == identifier, User.slug == identifier.lower())
+        )
+    )
     db_user = result_user.scalar_one_or_none()
 
     if db_user is None:

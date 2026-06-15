@@ -19,6 +19,21 @@ from datetime import datetime, timezone
 from PyQt6.QtWidgets import QMenu
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
+from call_engine import CallEngine
+
+def list_audio_devices():
+    try:
+        import sounddevice as sd
+        inputs, outputs = [], []
+        for i, d in enumerate(sd.query_devices()):
+            if d["max_input_channels"] > 0:
+                inputs.append((i, d["name"]))
+            if d["max_output_channels"] > 0:
+                outputs.append((i, d["name"]))
+        return inputs, outputs
+    except Exception as e:
+        print("audio list error:", e)
+        return [], []
 
 def format_last_seen(iso_str):
     if not iso_str:
@@ -72,9 +87,15 @@ AVATAR_PALETTE = [
     "#aa65dd","#6ec9cb","#faa774","#5288c1",
 ]
 
-BASE_URL = "http://localhost:8000"
+BASE_URL = "https://velo-n1cd.onrender.com"
+WS_URL = "wss://velo-n1cd.onrender.com"
+KLIPY_API_KEY = "kAqIH9ikknz91cFvEwroaGoea1pbXIyJZYJZmZLjtl9BBOadade58qkJKPdVDX9n"
+KLIPY_BASE = "https://api.klipy.com/api/v1"
 H = lambda token: {"Authorization": f"Bearer {token}"}
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+
+# Flag global pour relancer le login après déconnexion
+_RELOGIN = False
 
 
 # ── Avatar ────────────────────────────────────────────────
@@ -112,27 +133,70 @@ def make_avatar(name, size, image_path=""):
     return px
 
 
+def _squircle_path(size, n=5.0):
+    """iOS-style squircle (superellipse) path filling a size×size box."""
+    import math
+    path = QPainterPath()
+    cx = cy = size / 2.0
+    a = b = size / 2.0
+    steps = 180
+    pts = []
+    for i in range(steps + 1):
+        t = (i / steps) * 2 * math.pi
+        ct = math.cos(t); st = math.sin(t)
+        # superellipse parametric form
+        x = cx + a * (abs(ct) ** (2.0 / n)) * (1 if ct >= 0 else -1)
+        y = cy + b * (abs(st) ** (2.0 / n)) * (1 if st >= 0 else -1)
+        pts.append((x, y))
+    path.moveTo(pts[0][0], pts[0][1])
+    for x, y in pts[1:]:
+        path.lineTo(x, y)
+    path.closeSubpath()
+    return path
+
+
 def make_rounded_logo(path, size, radius_ratio=0.30):
-    """Logo cropped to a rounded square."""
-    px = QPixmap(size, size)
-    px.fill(Qt.GlobalColor.transparent)
-    p = QPainter(px)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    rr = size * radius_ratio
-    clip = QPainterPath()
-    clip.addRoundedRect(0, 0, size, size, rr, rr)
-    p.setClipPath(clip)
+    """Logo dans un squircle iOS avec fond dégradé bleu pour bien ressortir."""
+    # 1) Construit le masque squircle anti-aliasé
+    mask = QPixmap(size, size); mask.fill(Qt.GlobalColor.transparent)
+    mp = QPainter(mask)
+    mp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    mp.setBrush(QColor("white")); mp.setPen(Qt.PenStyle.NoPen)
+    mp.drawPath(_squircle_path(size))
+    mp.end()
+
+    # 2) Construit le contenu : fond dégradé + logo par-dessus
+    base = QPixmap(size, size); base.fill(Qt.GlobalColor.transparent)
+    bp = QPainter(base)
+    bp.setRenderHint(QPainter.RenderHint.Antialiasing)
+    bp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    # Dégradé bleu type icône iOS
+    g = QLinearGradient(0, 0, size, size)
+    g.setColorAt(0, QColor("#4a90d9"))
+    g.setColorAt(1, QColor("#2b5278"))
+    bp.fillRect(0, 0, size, size, g)
     if path and os.path.exists(path):
         src = QPixmap(path)
-        scaled = src.scaled(size, size,
-            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        # Logo légèrement réduit avec marge pour respirer
+        inner = int(size * 0.78)
+        scaled = src.scaled(inner, inner,
+            Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation)
-        x = (scaled.width() - size) // 2
-        y = (scaled.height() - size) // 2
-        p.drawPixmap(0, 0, scaled, x, y, size, size)
-    p.end()
-    return px
+        ox = (size - scaled.width()) // 2
+        oy = (size - scaled.height()) // 2
+        bp.drawPixmap(ox, oy, scaled)
+    bp.end()
+
+    # 3) Composite avec le masque squircle
+    out = QPixmap(size, size); out.fill(Qt.GlobalColor.transparent)
+    op = QPainter(out)
+    op.setRenderHint(QPainter.RenderHint.Antialiasing)
+    op.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    op.drawPixmap(0, 0, mask)
+    op.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    op.drawPixmap(0, 0, base)
+    op.end()
+    return out
 
 
 class Avatar(QLabel):
@@ -174,6 +238,34 @@ def api_get(path, token):
         return r.json() if r.status_code == 200 else None
     except Exception:
         return None
+
+def klipy_search(query, page=1, per_page=24):
+    try:
+        if query.strip():
+            url = f"{KLIPY_BASE}/{KLIPY_API_KEY}/gifs/search"
+            params = {"q": query, "page": page, "per_page": per_page}
+        else:
+            url = f"{KLIPY_BASE}/{KLIPY_API_KEY}/gifs/trending"
+            params = {"page": page, "per_page": per_page}
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        items = data.get("data", {}).get("data", [])
+        results = []
+        for it in items:
+            f = it.get("file", {})
+            md = f.get("md", {}).get("gif", {})
+            sm = f.get("sm", {}).get("gif", {})
+            hd = f.get("hd", {}).get("gif", {})
+            preview = md.get("url") or sm.get("url") or hd.get("url")
+            full = hd.get("url") or md.get("url") or preview
+            if preview and full:
+                results.append({"preview": preview, "url": full})
+        return results
+    except Exception as ex:
+        print("klipy error:", ex)
+        return []
 
 
 def api_post(path, token, payload):
@@ -311,8 +403,8 @@ class ProfileDialog(QDialog):
             lo.addWidget(status)
 
         lo.addSpacing(16)
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color:{C['divider']};"); lo.addWidget(sep)
+        sep = QFrame(); sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{C['divider']};border:none;"); lo.addWidget(sep)
         lo.addSpacing(12)
 
         st = api_get(f"/friends/status/{self.user['id']}", self.token) or {"status": "none"}
@@ -475,6 +567,16 @@ class SettingsDialog(QDialog):
         self.setFixedSize(430, 560)
         self.setStyleSheet(f"background:{C['bg']};")
         self._build()
+
+    def _combo_style(self):
+        return f"""
+            QComboBox {{background:{C['panel']};color:{C['text']};border:1.5px solid {C['card']};
+                border-radius:8px;padding:8px 12px;font-size:12px;font-family:'Segoe UI';}}
+            QComboBox:hover {{border-color:{C['accent']};}}
+            QComboBox::drop-down {{border:none;width:24px;}}
+            QComboBox QAbstractItemView {{background:{C['card']};color:{C['text']};
+                selection-background-color:{C['accent']};border:none;outline:none;}}
+        """
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(34, 30, 34, 30); lo.setSpacing(12)
         t = QLabel("My profile")
@@ -540,6 +642,41 @@ class SettingsDialog(QDialog):
             getattr(self.parent(), "notifications_on", True) if self.parent() else True)
         lo.addWidget(notif_row)
         self.notif_toggle.toggled.connect(self.notif_changed.emit)
+        sep3 = QFrame();
+        sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setStyleSheet(f"color:{C['divider']};")
+        lo.addWidget(sep3)
+
+        audio_title = QLabel("Call audio")
+        audio_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
+        audio_title.setStyleSheet(f"color:{C['text']};margin-top:4px;")
+        lo.addWidget(audio_title)
+
+        from PyQt6.QtWidgets import QComboBox
+        inputs, outputs = list_audio_devices()
+
+        lo.addWidget(QLabel("🎤 Microphone"))
+        self.mic_combo = QComboBox()
+        self.mic_combo.setStyleSheet(self._combo_style())
+        for idx, name in inputs:
+            self.mic_combo.addItem(name, idx)
+        lo.addWidget(self.mic_combo)
+
+        lo.addWidget(QLabel("🔊 Speaker"))
+        self.spk_combo = QComboBox()
+        self.spk_combo.setStyleSheet(self._combo_style())
+        for idx, name in outputs:
+            self.spk_combo.addItem(name, idx)
+        lo.addWidget(self.spk_combo)
+
+        # Pré-sélectionne la config actuelle
+        cfg = self.parent()._load_audio_config() if self.parent() else {"mic": None, "speaker": None}
+        if cfg.get("mic") is not None:
+            i = self.mic_combo.findData(cfg["mic"])
+            if i >= 0: self.mic_combo.setCurrentIndex(i)
+        if cfg.get("speaker") is not None:
+            i = self.spk_combo.findData(cfg["speaker"])
+            if i >= 0: self.spk_combo.setCurrentIndex(i)
         lo.addStretch()
         save = btn("Save changes", C["accent"], bold=True, font_size=14)
         save.setFixedHeight(46); save.clicked.connect(self._save); lo.addWidget(save)
@@ -547,6 +684,10 @@ class SettingsDialog(QDialog):
         p, _ = QFileDialog.getOpenFileName(self, "Choose image", "", "Images (*.png *.jpg *.jpeg *.webp)")
         if p: self.avatar_path = p; self.av_w.refresh(self.user.get("username", "?"), p)
     def _save(self):
+        if hasattr(self, "mic_combo") and self.parent():
+            mic_idx = self.mic_combo.currentData()
+            spk_idx = self.spk_combo.currentData()
+            self.parent()._save_audio_config(mic_idx, spk_idx)
         payload = {
             "username": self.un.text().strip(),
             "bio": self.bio.toPlainText().strip(),
@@ -660,7 +801,7 @@ class LoginDialog(QDialog):
         lo = QVBoxLayout(self); lo.setContentsMargins(48, 44, 48, 40); lo.setSpacing(0)
         icon = QLabel()
         if os.path.exists(LOGO_PATH):
-            icon.setPixmap(make_rounded_logo(LOGO_PATH, 104, radius_ratio=0.40))
+            icon.setPixmap(make_rounded_logo(LOGO_PATH, 112))
         else:
             icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 52))
             icon.setStyleSheet(f"color:{C['accent']};")
@@ -673,7 +814,8 @@ class LoginDialog(QDialog):
         sub = QLabel("Fast and secure messaging"); sub.setFont(QFont("Segoe UI", 12))
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color:{C['text2']};margin-bottom:28px;"); lo.addWidget(sub)
-        self.email = QLineEdit(); self.email.setPlaceholderText("Email address")
+        self.email = QLineEdit();
+        self.email.setPlaceholderText("Email or username")
         self.email.setFixedHeight(44); self.email.setStyleSheet(field(12)); lo.addWidget(self.email)
         lo.addSpacing(10)
         self.pw = QLineEdit(); self.pw.setPlaceholderText("Password")
@@ -700,7 +842,7 @@ class LoginDialog(QDialog):
         self.err.setText("")
         try:
             r = requests.post(f"{BASE_URL}/auth/login",
-                              json={"email": self.email.text().strip(), "password": self.pw.text()})
+                              json={"identifier": self.email.text().strip(), "password": self.pw.text()})
             if r.status_code == 200:
                 self.token = r.json()["access_token"]
                 self.user = api_get("/auth/me", self.token); self.accept()
@@ -948,8 +1090,8 @@ class GroupProfileDialog(QDialog):
         bio.setAlignment(Qt.AlignmentFlag.AlignCenter)
         bio.setStyleSheet(f"color:{C['text']};padding:8px 24px;")
         lo.addWidget(bio)
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color:{C['divider']};"); lo.addWidget(sep)
+        sep = QFrame(); sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{C['divider']};border:none;"); lo.addWidget(sep)
         mt = QLabel("MEMBERS")
         mt.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         mt.setStyleSheet(f"color:{C['text3']};padding:10px 24px 4px 24px;letter-spacing:1px;")
@@ -1249,11 +1391,517 @@ class VideoBubble(QWidget):
         else:
             self.player.play(); self.play_btn.setText("⏸  Pause")
 
+class ConvSettingsDialog(QDialog):
+    def __init__(self, token, other_user_id, other_name, parent=None):
+        super().__init__(parent)
+        self.token = token
+        self.other_user_id = other_user_id
+        self.setWindowTitle("Conversation settings")
+        self.setFixedSize(380, 240)
+        self.setStyleSheet(f"background:{C['bg']};")
+        self._build(other_name)
+    def _build(self, other_name):
+        lo = QVBoxLayout(self); lo.setContentsMargins(28, 24, 28, 24); lo.setSpacing(14)
+        t = QLabel("Conversation settings")
+        t.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
+        sub = QLabel(f"with {other_name}")
+        sub.setFont(QFont("Segoe UI", 11))
+        sub.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(sub)
+        # Toggle éphémère
+        row = QWidget()
+        rl = QHBoxLayout(row); rl.setContentsMargins(0, 8, 0, 0)
+        col = QVBoxLayout(); col.setSpacing(2)
+        lab = QLabel("Delete after reading")
+        lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+        lab.setStyleSheet(f"color:{C['text']};")
+        desc = QLabel("Messages vanish when you close the chat")
+        desc.setFont(QFont("Segoe UI", 10))
+        desc.setStyleSheet(f"color:{C['text2']};")
+        col.addWidget(lab); col.addWidget(desc)
+        rl.addLayout(col); rl.addStretch()
+        self.toggle = Toggle(False)
+        rl.addWidget(self.toggle)
+        lo.addWidget(row)
+        self.status = QLabel(""); self.status.setFont(QFont("Segoe UI", 10))
+        self.status.setStyleSheet(f"color:{C['green']};")
+        lo.addWidget(self.status)
+        lo.addStretch()
+        # Charge l'état actuel
+        cur = api_get(f"/conversation/settings/{self.other_user_id}", self.token) or {}
+        self.toggle.setChecked(cur.get("ephemeral", False))
+        # Connecte le changement
+        self.toggle.toggled.connect(self._save)
+    def _save(self, checked):
+        api_post("/conversation/settings", self.token,
+                 {"other_user_id": self.other_user_id, "ephemeral": checked})
+        self.status.setText("✓ Saved")
+        QTimer.singleShot(1200, lambda: self.status.setText(""))
+
+class EmojiPicker(QDialog):
+    emoji_picked = pyqtSignal(str)
+    EMOJIS = [
+        "😀","😃","😄","😁","😆","😅","😂","🤣","😊","😇",
+        "🙂","🙃","😉","😌","😍","🥰","😘","😗","😙","😚",
+        "😋","😛","😝","😜","🤪","🤨","🧐","🤓","😎","🥸",
+        "🤩","🥳","😏","😒","😞","😔","😟","😕","🙁","☹️",
+        "😣","😖","😫","😩","🥺","😢","😭","😤","😠","😡",
+        "🤬","🤯","😳","🥵","🥶","😱","😨","😰","😥","😓",
+        "🤗","🤔","🤭","🤫","🤥","😶","😐","😑","😬","🙄",
+        "😯","😦","😧","😮","😲","🥱","😴","🤤","😪","😵",
+        "🤐","🥴","🤢","🤮","🤧","😷","🤒","🤕","🤑","🤠",
+        "👍","👎","👌","✌️","🤞","🤟","🤘","👈","👉","👆",
+        "👇","☝️","✋","🤚","🖐️","🖖","👋","🤙","💪","🙏",
+        "❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","💔",
+        "💕","💞","💓","💗","💖","💘","💝","🔥","⭐","✨",
+        "🎉","🎊","🎈","🎁","🏆","🥇","💯","✅","❌","❓",
+    ]
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Emojis")
+        self.setFixedSize(360, 320)
+        self.setStyleSheet(f"background:{C['bg']};")
+        self._build()
+    def _build(self):
+        lo = QVBoxLayout(self); lo.setContentsMargins(12, 12, 12, 12); lo.setSpacing(8)
+        t = QLabel("Pick an emoji")
+        t.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("border:none;background:transparent;")
+        grid_w = QWidget(); grid_w.setStyleSheet("background:transparent;")
+        from PyQt6.QtWidgets import QGridLayout
+        grid = QGridLayout(grid_w); grid.setSpacing(2)
+        cols = 8
+        for i, emo in enumerate(self.EMOJIS):
+            b = QPushButton(emo)
+            b.setFixedSize(38, 38)
+            b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            b.setStyleSheet(f"""QPushButton{{background:transparent;border:none;
+                font-size:20px;border-radius:8px;}}
+                QPushButton:hover{{background:{C['hover']};}}""")
+            b.clicked.connect(lambda _, e=emo: self._pick(e))
+            grid.addWidget(b, i // cols, i % cols)
+        scroll.setWidget(grid_w); lo.addWidget(scroll)
+    def _pick(self, emo):
+        self.emoji_picked.emit(emo)
+
+class GifPicker(QDialog):
+    gif_picked = pyqtSignal(str)  # émet l'URL du GIF choisi
+    def __init__(self, token, parent=None):
+        super().__init__(parent)
+        self.token = token
+        self.setWindowTitle("GIFs")
+        self.setFixedSize(440, 520)
+        self.setStyleSheet(f"background:{C['bg']};")
+        self._workers = []
+        self._build()
+        self._search("")  # trending au départ
+    def _build(self):
+        lo = QVBoxLayout(self); lo.setContentsMargins(16, 16, 16, 16); lo.setSpacing(10)
+        # Barre de recherche + onglet favoris
+        top = QHBoxLayout()
+        self.inp = QLineEdit(); self.inp.setPlaceholderText("Search GIFs…")
+        self.inp.setFixedHeight(40); self.inp.setStyleSheet(field())
+        self.inp.textChanged.connect(self._on_type)
+        top.addWidget(self.inp)
+        self.fav_btn = QPushButton("⭐")
+        self.fav_btn.setFixedSize(40, 40)
+        self.fav_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.fav_btn.setStyleSheet(f"""QPushButton{{background:{C['card']};border:none;
+            border-radius:10px;font-size:18px;}}
+            QPushButton:hover{{background:{C['hover']};}}""")
+        self.fav_btn.clicked.connect(self._show_favorites)
+        top.addWidget(self.fav_btn)
+        lo.addLayout(top)
+        # Zone de résultats (grille scrollable)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("border:none;background:transparent;")
+        self.grid_w = QWidget(); self.grid_w.setStyleSheet("background:transparent;")
+        from PyQt6.QtWidgets import QGridLayout
+        self.grid = QGridLayout(self.grid_w); self.grid.setSpacing(6)
+        self.scroll.setWidget(self.grid_w); lo.addWidget(self.scroll)
+        # Timer de debounce pour la recherche
+        self._search_timer = QTimer(self); self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(lambda: self._search(self.inp.text()))
+    def _on_type(self):
+        self._search_timer.start(500)
+    def _clear_grid(self):
+        while self.grid.count():
+            it = self.grid.takeAt(0)
+            if it.widget(): it.widget().deleteLater()
+    def _search(self, query):
+        self._clear_grid()
+        loading = QLabel("Loading…"); loading.setStyleSheet(f"color:{C['text2']};")
+        self.grid.addWidget(loading, 0, 0)
+        w = ApiWorker(klipy_search, query)
+        w.done.connect(self._show_results)
+        w.done.connect(lambda: self._workers.remove(w) if w in self._workers else None)
+        self._workers.append(w); w.start()
+    def _show_results(self, results):
+        self._clear_grid()
+        if not results:
+            empty = QLabel("No GIFs found."); empty.setStyleSheet(f"color:{C['text2']};")
+            self.grid.addWidget(empty, 0, 0); return
+        cols = 2
+        for i, g in enumerate(results):
+            cell = self._gif_cell(g)
+            self.grid.addWidget(cell, i // cols, i % cols)
+    def _gif_cell(self, g):
+        cell = QWidget(); cell.setFixedSize(190, 150)
+        cell.setStyleSheet(f"background:{C['card']};border-radius:10px;")
+        cl = QVBoxLayout(cell); cl.setContentsMargins(4, 4, 4, 4)
+        gif = AnimatedGif(g["preview"], max_width=180)
+        gif.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        gif.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        gif.mousePressEvent = lambda e, url=g["url"]: self._pick(url)
+        cl.addWidget(gif)
+        return cell
+    def _pick(self, url):
+        self.gif_picked.emit(url)
+        self.accept()
+    def _show_favorites(self):
+        favs = self._load_favs()
+        self._clear_grid()
+        if not favs:
+            empty = QLabel("No favorites yet. Long-press a GIF to add.")
+            empty.setStyleSheet(f"color:{C['text2']};"); empty.setWordWrap(True)
+            self.grid.addWidget(empty, 0, 0); return
+        cols = 2
+        for i, url in enumerate(favs):
+            cell = self._gif_cell({"preview": url, "url": url})
+            self.grid.addWidget(cell, i // cols, i % cols)
+    def _load_favs(self):
+        try:
+            import json, os
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gif_favorites.json")
+            if os.path.exists(path):
+                with open(path) as f: return json.load(f)
+        except Exception: pass
+        return []
+
+class GifDownloader(QThread):
+    loaded = pyqtSignal(object)
+
+    def __init__(self, url):
+        super().__init__();
+        self.url = url
+
+    def run(self):
+        try:
+            r = requests.get(self.url, timeout=20)
+            self.loaded.emit(r.content if r.status_code == 200 else None)
+        except Exception:
+            self.loaded.emit(None)
+
+class AnimatedGif(QLabel):
+    """Affiche un GIF animé depuis une URL, chargé en arrière-plan."""
+    def __init__(self, url, max_width=200, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.max_width = max_width
+        self._buffer = None
+        self._movie = None
+        self.setStyleSheet("background:transparent;")
+        self.setText("…")
+        self._loader = GifDownloader(url)
+        self._loader.loaded.connect(self._play)
+        self._loader.start()
+    def _play(self, data):
+        if not data:
+            self.setText("⚠")
+            return
+        from PyQt6.QtCore import QByteArray, QBuffer, QSize
+        from PyQt6.QtGui import QMovie
+        self._bytes = QByteArray(data)
+        self._buffer = QBuffer(self._bytes)
+        self._buffer.open(QBuffer.OpenModeFlag.ReadOnly)
+        self._movie = QMovie()
+        self._movie.setDevice(self._buffer)
+        self._movie.setCacheMode(QMovie.CacheMode.CacheAll)
+        # Lit la taille réelle via la première frame, AVANT de lancer
+        self._movie.jumpToFrame(0)
+        orig = self._movie.currentImage().size()
+        if orig.width() > 0:
+            ratio = min(1.0, self.max_width / orig.width())
+            scaled_size = QSize(int(orig.width() * ratio), int(orig.height() * ratio))
+            self._movie.setScaledSize(scaled_size)
+            self.setFixedSize(scaled_size)
+        self.setMovie(self._movie)
+        self._movie.start()
+
+
+class GifDownloader(QThread):
+    loaded = pyqtSignal(object)
+    def __init__(self, url):
+        super().__init__(); self.url = url
+    def run(self):
+        try:
+            r = requests.get(self.url, timeout=20)
+            self.loaded.emit(r.content if r.status_code == 200 else None)
+        except Exception:
+            self.loaded.emit(None)
+
+class CallDialog(QDialog):
+    def __init__(self, name, avatar_url, incoming=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Call")
+        self.setFixedSize(320, 420)
+        self.setStyleSheet(f"background:{C['bg']};")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self._build(name, avatar_url, incoming)
+    def _build(self, name, avatar_url, incoming):
+        lo = QVBoxLayout(self); lo.setContentsMargins(0, 40, 0, 30); lo.setSpacing(0)
+        lo.addStretch()
+        av = Avatar(name, 120, avatar_url)
+        avw = QHBoxLayout(); avw.addStretch(); avw.addWidget(av); avw.addStretch()
+        lo.addLayout(avw)
+        lo.addSpacing(20)
+        nm = QLabel(name); nm.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        nm.setAlignment(Qt.AlignmentFlag.AlignCenter); nm.setStyleSheet(f"color:{C['text']};")
+        lo.addWidget(nm)
+        self.status = QLabel("Incoming call…" if incoming else "Calling…")
+        self.status.setFont(QFont("Segoe UI", 13))
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setStyleSheet(f"color:{C['text2']};margin-top:6px;")
+        lo.addWidget(self.status)
+        lo.addStretch()
+        # Boutons
+        btns = QHBoxLayout(); btns.setSpacing(30)
+        btns.addStretch()
+        if incoming:
+            self.accept_btn = QPushButton("✓")
+            self.accept_btn.setFixedSize(64, 64)
+            self.accept_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            self.accept_btn.setStyleSheet(f"""QPushButton{{background:{C['green']};color:white;
+                border:none;border-radius:32px;font-size:26px;}}
+                QPushButton:hover{{background:#48b352;}}""")
+            btns.addWidget(self.accept_btn)
+        self.hangup_btn = QPushButton("✕")
+        self.hangup_btn.setFixedSize(64, 64)
+        self.hangup_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.hangup_btn.setStyleSheet(f"""QPushButton{{background:{C['red']};color:white;
+            border:none;border-radius:32px;font-size:26px;}}
+            QPushButton:hover{{background:#d04545;}}""")
+        btns.addWidget(self.hangup_btn)
+        btns.addStretch()
+        lo.addLayout(btns)
+    def set_status(self, text):
+        self.status.setText(text)
+
+# ── Full-page Settings ────────────────────────────────────
+class SettingsPage(QWidget):
+    profile_updated = pyqtSignal(dict)
+    notif_changed = pyqtSignal(bool)
+    closed = pyqtSignal()
+    logout_requested = pyqtSignal()
+
+    def __init__(self, token, user, parent=None):
+        super().__init__(parent)
+        self.token = token
+        self.user = user
+        self.avatar_path = ""
+        self.setStyleSheet(f"background:{C['bg']};")
+        self._build()
+
+    def _combo_style(self):
+        return f"""
+            QComboBox {{background:{C['panel']};color:{C['text']};border:1.5px solid {C['card']};
+                border-radius:8px;padding:9px 12px;font-size:12px;font-family:'Segoe UI';}}
+            QComboBox:hover {{border-color:{C['accent']};}}
+            QComboBox::drop-down {{border:none;width:24px;}}
+            QComboBox QAbstractItemView {{background:{C['card']};color:{C['text']};
+                selection-background-color:{C['accent']};border:none;outline:none;}}
+        """
+
+    def _build(self):
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        # ── Top bar with back button ──────────────────────
+        topbar = QWidget(); topbar.setFixedHeight(58)
+        topbar.setStyleSheet(f"background:{C['sidebar']};border-bottom:1px solid {C['divider']};")
+        tl = QHBoxLayout(topbar); tl.setContentsMargins(12, 0, 16, 0); tl.setSpacing(10)
+        back = QPushButton("←")
+        back.setFixedSize(36, 36)
+        back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        back.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        back.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['text']};
+            border:none;border-radius:18px;}}
+            QPushButton:hover{{background:{C['hover']};}}""")
+        back.clicked.connect(self.closed.emit)
+        title = QLabel("Settings")
+        title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
+        title.setStyleSheet(f"color:{C['text']};")
+        tl.addWidget(back); tl.addWidget(title); tl.addStretch()
+        outer.addWidget(topbar)
+
+        # ── Scrollable content ────────────────────────────
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("border:none;background:transparent;")
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget(); content.setStyleSheet("background:transparent;")
+        # Center the content column, max width ~560
+        wrap = QHBoxLayout(content); wrap.setContentsMargins(0, 0, 0, 0)
+        wrap.addStretch()
+        col_host = QWidget(); col_host.setFixedWidth(560)
+        col_host.setStyleSheet("background:transparent;")
+        lo = QVBoxLayout(col_host); lo.setContentsMargins(40, 28, 40, 28); lo.setSpacing(14)
+        wrap.addWidget(col_host); wrap.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        def section_label(text):
+            l = QLabel(text)
+            l.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            l.setStyleSheet(f"color:{C['text3']};letter-spacing:1px;margin-top:6px;")
+            return l
+
+        def small_label(text):
+            l = QLabel(text)
+            l.setStyleSheet(f"color:{C['text2']};font-size:11px;font-family:'Segoe UI';")
+            return l
+
+        # ── Avatar ────────────────────────────────────────
+        self.av_w = Avatar(self.user.get("username", "?"), 92, self.user.get("avatar_url", ""))
+        self.av_w.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.av_w.mousePressEvent = lambda e: self._pick()
+        ch = QLabel("Tap to change"); ch.setFont(QFont("Segoe UI", 10))
+        ch.setStyleSheet(f"color:{C['text2']};")
+        lo.addWidget(self.av_w, alignment=Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(ch, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # ── Profile fields ────────────────────────────────
+        lo.addWidget(section_label("PROFILE"))
+        lo.addWidget(small_label("Username"))
+        self.un = QLineEdit(self.user.get("username", "")); self.un.setFixedHeight(44)
+        self.un.setStyleSheet(field()); lo.addWidget(self.un)
+        lo.addWidget(small_label("Bio"))
+        self.bio = QTextEdit(); self.bio.setFixedHeight(80)
+        self.bio.setPlainText(self.user.get("bio", "")); self.bio.setStyleSheet(field())
+        lo.addWidget(self.bio)
+
+        # ── Privacy toggles ───────────────────────────────
+        sep1 = QFrame(); sep1.setFixedHeight(1); sep1.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(4); lo.addWidget(sep1); lo.addSpacing(4)
+        lo.addWidget(section_label("PRIVACY"))
+
+        def toggle_row(label_text, desc_text, checked):
+            row = QWidget()
+            rl = QHBoxLayout(row); rl.setContentsMargins(0, 6, 0, 6)
+            cc = QVBoxLayout(); cc.setSpacing(2)
+            lab = QLabel(label_text)
+            lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+            lab.setStyleSheet(f"color:{C['text']};")
+            desc = QLabel(desc_text)
+            desc.setFont(QFont("Segoe UI", 10))
+            desc.setStyleSheet(f"color:{C['text2']};")
+            cc.addWidget(lab); cc.addWidget(desc)
+            rl.addLayout(cc); rl.addStretch()
+            tog = Toggle(checked)
+            rl.addWidget(tog, alignment=Qt.AlignmentFlag.AlignVCenter)
+            return row, tog
+
+        priv_row, self.priv_toggle = toggle_row(
+            "Private profile", "Only friends can see your bio and message you",
+            self.user.get("is_private", False))
+        lo.addWidget(priv_row)
+        online_row, self.online_toggle = toggle_row(
+            "Show online status", "Others can see when you're online",
+            self.user.get("show_online", True))
+        lo.addWidget(online_row)
+        notif_row, self.notif_toggle = toggle_row(
+            "Notifications", "Sound and desktop alerts for new messages",
+            getattr(self.parent(), "notifications_on", True) if self.parent() else True)
+        lo.addWidget(notif_row)
+        self.notif_toggle.toggled.connect(self.notif_changed.emit)
+
+        # ── Call audio ────────────────────────────────────
+        sep2 = QFrame(); sep2.setFixedHeight(1); sep2.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(4); lo.addWidget(sep2); lo.addSpacing(4)
+        lo.addWidget(section_label("CALL AUDIO"))
+
+        from PyQt6.QtWidgets import QComboBox
+        inputs, outputs = list_audio_devices()
+        lo.addWidget(small_label("🎤 Microphone"))
+        self.mic_combo = QComboBox(); self.mic_combo.setStyleSheet(self._combo_style())
+        for idx, name in inputs:
+            self.mic_combo.addItem(name, idx)
+        lo.addWidget(self.mic_combo)
+        lo.addWidget(small_label("🔊 Speaker"))
+        self.spk_combo = QComboBox(); self.spk_combo.setStyleSheet(self._combo_style())
+        for idx, name in outputs:
+            self.spk_combo.addItem(name, idx)
+        lo.addWidget(self.spk_combo)
+        cfg = self.parent()._load_audio_config() if self.parent() else {"mic": None, "speaker": None}
+        if cfg.get("mic") is not None:
+            i = self.mic_combo.findData(cfg["mic"])
+            if i >= 0: self.mic_combo.setCurrentIndex(i)
+        if cfg.get("speaker") is not None:
+            i = self.spk_combo.findData(cfg["speaker"])
+            if i >= 0: self.spk_combo.setCurrentIndex(i)
+
+        # ── Status + Save ─────────────────────────────────
+        self.status = QLabel(""); self.status.setFont(QFont("Segoe UI", 11))
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addSpacing(6); lo.addWidget(self.status)
+        save = btn("Save changes", C["accent"], bold=True, font_size=14)
+        save.setFixedHeight(48); save.clicked.connect(self._save); lo.addWidget(save)
+
+        # ── Logout ────────────────────────────────────────
+        sep3 = QFrame(); sep3.setFixedHeight(1); sep3.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(6); lo.addWidget(sep3); lo.addSpacing(6)
+        logout = QPushButton("Log out")
+        logout.setFixedHeight(46)
+        logout.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        logout.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['red']};
+            border:1.5px solid {C['red']};border-radius:10px;font-size:13px;
+            font-weight:bold;font-family:'Segoe UI';}}
+            QPushButton:hover{{background:{C['red']};color:white;}}""")
+        logout.clicked.connect(self.logout_requested.emit)
+        lo.addWidget(logout)
+        lo.addStretch()
+
+    def _pick(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Choose image", "", "Images (*.png *.jpg *.jpeg *.webp)")
+        if p:
+            self.avatar_path = p
+            self.av_w.refresh(self.user.get("username", "?"), p)
+
+    def _save(self):
+        if hasattr(self, "mic_combo") and self.parent():
+            self.parent()._save_audio_config(self.mic_combo.currentData(), self.spk_combo.currentData())
+        payload = {
+            "username": self.un.text().strip(),
+            "bio": self.bio.toPlainText().strip(),
+            "is_private": self.priv_toggle.isChecked(),
+            "show_online": self.online_toggle.isChecked(),
+        }
+        if self.avatar_path: payload["avatar_url"] = self.avatar_path
+        try:
+            r = requests.patch(f"{BASE_URL}/auth/me", json=payload, headers=H(self.token))
+            if r.status_code == 200:
+                updated = r.json()
+                if self.avatar_path: updated["avatar_url"] = self.avatar_path
+                self.profile_updated.emit(updated)
+                self.status.setStyleSheet(f"color:{C['green']};")
+                self.status.setText("✓ Profile updated")
+            else:
+                self.status.setStyleSheet(f"color:{C['red']};")
+                self.status.setText("Update failed.")
+        except Exception:
+            self.status.setStyleSheet(f"color:{C['red']};")
+            self.status.setText("Cannot reach server.")
+
+
 # ── Main window ───────────────────────────────────────────
 class VeloApp(QMainWindow):
     sig_msg = pyqtSignal(str, int)
     sig_group_msg = pyqtSignal(str)
     sig_group_closed = pyqtSignal(int)
+    sig_call_incoming = pyqtSignal(int)
+    sig_call_connected = pyqtSignal()
+    sig_call_ended = pyqtSignal()
+    sig_call_unavailable = pyqtSignal()
     def __init__(self, token, user):
         super().__init__()
         self.token = token
@@ -1263,6 +1911,19 @@ class VeloApp(QMainWindow):
         self.groups = {}
         self.current_group_id = None
         self.ws = None
+        _audio_cfg = self._load_audio_config()
+        self.call_engine = CallEngine(
+            WS_URL,
+            self.user["id"],
+            mic_index=_audio_cfg.get("mic"),
+            speaker_index=_audio_cfg.get("speaker"),
+        )
+        self.call_engine.on_incoming = lambda from_id: self.sig_call_incoming.emit(from_id)
+        self.call_engine.on_connected = lambda: self.sig_call_connected.emit()
+        self.call_engine.on_ended = lambda: self.sig_call_ended.emit()
+        self.call_engine.on_unavailable = lambda: self.sig_call_unavailable.emit()
+        self.call_engine.start()
+        self.active_call_dialog = None
         self.notifications_on = True
         self._workers = []
         self.setWindowTitle("Velo")
@@ -1277,6 +1938,10 @@ class VeloApp(QMainWindow):
         self.sig_msg.connect(self._on_incoming)
         self.sig_group_msg.connect(self._on_group_incoming)
         self.sig_group_closed.connect(self._on_group_closed)
+        self.sig_call_incoming.connect(self._on_call_incoming)
+        self.sig_call_connected.connect(self._on_call_connected)
+        self.sig_call_ended.connect(self._on_call_ended)
+        self.sig_call_unavailable.connect(self._on_call_unavailable)
         self.group_ws = None
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._periodic_refresh)
@@ -1286,6 +1951,136 @@ class VeloApp(QMainWindow):
         self._typing_timer.timeout.connect(self._stop_typing)
         self._is_typing = False
         self.typing_bubble = None
+
+    def _load_audio_config(self):
+        import json, os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_config.json")
+        try:
+            if os.path.exists(path):
+                with open(path) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {"mic": None, "speaker": None}
+
+    def _save_audio_config(self, mic_idx, speaker_idx):
+        import json, os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_config.json")
+        try:
+            with open(path, "w") as f:
+                json.dump({"mic": mic_idx, "speaker": speaker_idx}, f)
+        except Exception as e:
+            print("audio config save error:", e)
+        # Applique tout de suite au moteur d'appel
+        self.call_engine.mic_index = mic_idx
+        self.call_engine.speaker_index = speaker_idx
+
+    def _start_call(self):
+        if not self.recv_id:
+            return
+        name = self.friends[self.recv_id].uname if self.recv_id in self.friends else "User"
+        avatar = ""
+        self.active_call_dialog = CallDialog(name, avatar, incoming=False, parent=self)
+        self.active_call_dialog.hangup_btn.clicked.connect(self._hangup_call)
+        self.call_engine.call(self.recv_id)
+        self.active_call_dialog.show()
+
+    def _on_call_incoming(self, from_id):
+        # Récupère le nom de l'appelant
+        name = "User"
+        if from_id in self.friends:
+            name = self.friends[from_id].uname
+        self.active_call_dialog = CallDialog(name, "", incoming=True, parent=self)
+        self.active_call_dialog.accept_btn.clicked.connect(self._accept_call)
+        self.active_call_dialog.hangup_btn.clicked.connect(self._decline_call)
+        self.active_call_dialog.show()
+        # Son de sonnerie
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            pass
+
+    def _accept_call(self):
+        self.call_engine.accept()
+        if self.active_call_dialog:
+            self.active_call_dialog.set_status("Connected")
+            # Cache le bouton accepter
+            self.active_call_dialog.accept_btn.setVisible(False)
+
+    def _decline_call(self):
+        self.call_engine.decline()
+        self._close_call_dialog()
+
+    def _hangup_call(self):
+        self.call_engine.hangup()
+        self._close_call_dialog()
+
+    def _on_call_connected(self):
+        if self.active_call_dialog:
+            self.active_call_dialog.set_status("Connected")
+
+    def _on_call_ended(self):
+        self._close_call_dialog()
+
+    def _on_call_unavailable(self):
+        if self.active_call_dialog:
+            self.active_call_dialog.set_status("User unavailable")
+            QTimer.singleShot(1500, self._close_call_dialog)
+
+    def _close_call_dialog(self):
+        if self.active_call_dialog:
+            self.active_call_dialog.close()
+            self.active_call_dialog = None
+
+    def _open_gif(self):
+        if not self.recv_id and not self.current_group_id:
+            return
+        d = GifPicker(self.token, self)
+        d.gif_picked.connect(self._send_gif)
+        d.exec()
+
+    def _send_gif(self, url):
+        # On envoie le GIF comme une pièce jointe de type image
+        info = {"type": "image", "url": url, "name": "gif"}
+        msg = f"[FILE]image|{url}|gif"
+        if self.current_group_id and self.group_ws:
+            try:
+                self.group_ws.send(msg)
+                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, self._make_attachment(info, True))
+                self._scroll_bottom()
+            except Exception as ex:
+                print(ex)
+        elif self.recv_id and self.ws:
+            try:
+                self.ws.send(f"{self.recv_id}:{msg}")
+                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, self._make_attachment(info, True))
+                self._scroll_bottom()
+            except Exception as ex:
+                print(ex)
+
+    def _open_emoji(self):
+        d = EmojiPicker(self)
+        d.emoji_picked.connect(self._insert_emoji)
+        d.exec()
+
+    def _insert_emoji(self, emo):
+        # Insère l'emoji à la position du curseur dans le champ
+        self.inp.setText(self.inp.text() + emo)
+        self.inp.setFocus()
+
+    def _clear_ephemeral(self, uid):
+        if uid is None:
+            return
+        self._async(api_post, lambda r: None,
+                    f"/conversation/clear_read/{uid}", self.token, {})
+
+    def _open_conv_settings(self):
+        if not self.recv_id:
+            return
+        other_name = self.friends[self.recv_id].uname if self.recv_id in self.friends else "user"
+        d = ConvSettingsDialog(self.token, self.recv_id, other_name, self)
+        d.exec()
 
     def _parse_attachment(self, content, outgoing):
         # content = "[FILE]type|url|name"
@@ -1301,13 +2096,30 @@ class VeloApp(QMainWindow):
         ftype = info.get("type", "file")
         url = info.get("url", "")
         name = info.get("name", "file")
-        full_url = f"{BASE_URL}{url}"
+        full_url = url if url.startswith("http") else f"{BASE_URL}{url}"
+        # GIF animé (URL externe se terminant par .gif)
+        if full_url.lower().endswith(".gif"):
+            return self._make_gif_bubble(full_url, outgoing)
         if ftype == "image":
             return ImageBubble(full_url, self.token, outgoing)
         elif ftype == "video":
             return VideoBubble(full_url, self.token, name, outgoing)
         else:
             return FileBubble(full_url, self.token, name, outgoing)
+
+    def _make_gif_bubble(self, url, outgoing):
+        wrap = QWidget()
+        lo = QHBoxLayout(wrap);
+        lo.setContentsMargins(16, 3, 16, 3)
+        gif = AnimatedGif(url, max_width=220)
+        gif.setStyleSheet(f"background:{C['msg_out'] if outgoing else C['msg_in']};border-radius:12px;padding:4px;")
+        if outgoing:
+            lo.addStretch();
+            lo.addWidget(gif)
+        else:
+            lo.addWidget(gif);
+            lo.addStretch()
+        return wrap
 
     def _attach_menu(self):
         if not self.recv_id and not self.current_group_id:
@@ -1319,9 +2131,13 @@ class VeloApp(QMainWindow):
             QMenu::item {{padding:8px 20px;border-radius:6px;}}
             QMenu::item:selected {{background:{C['hover']};}}
         """)
+        menu.addAction("😀  Emoji", self._open_emoji)
+        menu.addAction("🎞  GIF", self._open_gif)
+        menu.addSeparator()
         menu.addAction("🖼  Image", lambda: self._pick_attachment("image"))
         menu.addAction("🎬  Video", lambda: self._pick_attachment("video"))
         menu.addAction("📎  File", lambda: self._pick_attachment("file"))
+        menu.exec(QCursor.pos())
         menu.exec(QCursor.pos())
 
     def _pick_attachment(self, kind):
@@ -1402,12 +2218,6 @@ class VeloApp(QMainWindow):
         self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, lbl)
         self.last_status_label = lbl
 
-    def _open_settings(self):
-        d = SettingsDialog(self.token, self.user, self)
-        d.profile_updated.connect(self._on_updated)
-        d.notif_changed.connect(self._set_notifications)
-        d.exec()
-
     def _set_notifications(self, on):
         self.notifications_on = on
 
@@ -1448,7 +2258,7 @@ class VeloApp(QMainWindow):
             except Exception:
                 pass
         self.group_ws = websocket.WebSocketApp(
-            f"ws://localhost:8000/chat/group_ws/{gid}/{self.user['id']}",
+            f"{WS_URL}/chat/group_ws/{gid}/{self.user['id']}",
             on_message=lambda ws, msg: self.sig_group_msg.emit(msg),
             on_close=lambda ws, code, reason: self.sig_group_closed.emit(gid))
         threading.Thread(target=self.group_ws.run_forever, daemon=True).start()
@@ -1466,6 +2276,8 @@ class VeloApp(QMainWindow):
         self._scroll_bottom()
 
     def _select_group(self, gid):
+        if self.recv_id:
+            self._clear_ephemeral(self.recv_id)
         # Désélectionne amis et groupes
         for w in self.friends.values(): w.set_selected(False)
         for w in self.groups.values(): w.set_selected(False)
@@ -1473,6 +2285,8 @@ class VeloApp(QMainWindow):
         self.current_group_id = gid
         self.recv_id = None  # on est en mode groupe
         self.view_prof.setVisible(True)
+        self.conv_settings_btn.setVisible(False)
+        self.call_btn.setVisible(False)
         self.ch_av.setVisible(True)
         self._set_can_send(True)
         # Vide les messages
@@ -1575,7 +2389,11 @@ class VeloApp(QMainWindow):
                 QPushButton:hover{{background:{C['hover']};color:{C['text']};}}""")
 
     def _build_ui(self):
-        root = QWidget(); self.setCentralWidget(root)
+        # Stacked: page 0 = main app, page 1 = settings
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        root = QWidget()
         main = QHBoxLayout(root); main.setContentsMargins(0, 0, 0, 0); main.setSpacing(0)
 
         # ── Sidebar ──────────────────────────────────────
@@ -1650,9 +2468,31 @@ class VeloApp(QMainWindow):
         self.ch_sub = QLabel(""); self.ch_sub.setFont(QFont("Segoe UI", 11))
         self.ch_sub.setStyleSheet(f"color:{C['text2']};")
         ncol = QVBoxLayout(); ncol.setSpacing(1); ncol.addWidget(self.ch_name); ncol.addWidget(self.ch_sub)
+        self.call_btn = QPushButton("📞")
+        self.call_btn.setFixedSize(36, 36)
+        self.call_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.call_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['text2']};
+                   border:none;border-radius:18px;font-size:16px;}}
+                   QPushButton:hover{{background:{C['hover']};color:{C['green']};}}""")
+        self.call_btn.setVisible(False)
+        self.call_btn.clicked.connect(self._start_call)
+        self.conv_settings_btn = QPushButton("⚙")
+        self.conv_settings_btn.setFixedSize(36, 36)
+        self.conv_settings_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.conv_settings_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['text2']};
+                   border:none;border-radius:18px;font-size:16px;}}
+                   QPushButton:hover{{background:{C['hover']};color:{C['text']};}}""")
+        self.conv_settings_btn.setVisible(False)
+        self.conv_settings_btn.clicked.connect(self._open_conv_settings)
         self.view_prof = btn("View profile", C["card"], C["text2"], font_size=12)
-        self.view_prof.setVisible(False); self.view_prof.clicked.connect(self._view_profile)
-        chl.addWidget(self.ch_av); chl.addLayout(ncol); chl.addStretch(); chl.addWidget(self.view_prof)
+        self.view_prof.setVisible(False);
+        self.view_prof.clicked.connect(self._view_profile)
+        chl.addWidget(self.ch_av);
+        chl.addLayout(ncol);
+        chl.addStretch()
+        chl.addWidget(self.call_btn);
+        chl.addWidget(self.conv_settings_btn);
+        chl.addWidget(self.view_prof)
         cl.addWidget(self.ch_hdr)
 
         self.msg_scroll = QScrollArea(); self.msg_scroll.setWidgetResizable(True)
@@ -1668,12 +2508,12 @@ class VeloApp(QMainWindow):
         ibw = QWidget(); ibw.setFixedHeight(66)
         ibw.setStyleSheet(f"background:{C['sidebar']};border-top:1px solid {C['divider']};")
         ib = QHBoxLayout(ibw); ib.setContentsMargins(14, 10, 14, 10); ib.setSpacing(10)
-        attach_btn = QPushButton("+")
+        attach_btn = QPushButton("＋")
         attach_btn.setFixedSize(40, 40)
         attach_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        attach_btn.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        attach_btn.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         attach_btn.setStyleSheet(f"""QPushButton{{background:{C['card']};color:{C['accent']};
-                   border:none;border-radius:20px;padding:0px;text-align:center;}}
+                   border:none;border-radius:20px;padding:0px;}}
                    QPushButton:hover{{background:{C['hover']};}}""")
         attach_btn.clicked.connect(self._attach_menu)
         self.inp = QLineEdit(); self.inp.setPlaceholderText("Message")
@@ -1691,6 +2531,10 @@ class VeloApp(QMainWindow):
         ib.addWidget(attach_btn)
         ib.addWidget(self.inp); ib.addWidget(sbtn); cl.addWidget(ibw)
         main.addWidget(chat)
+
+        # Add main app as page 0; settings page built lazily
+        self.stack.addWidget(root)
+        self.settings_page = None
 
     # ── Friends ───────────────────────────────────────────
     def _load_friends(self):
@@ -1723,6 +2567,9 @@ class VeloApp(QMainWindow):
                 QPushButton:hover{{background:{C['hover']};color:{C['text']};}}""")
 
     def _select(self, uid):
+        prev = self.recv_id
+        if prev and prev != uid:
+            self._clear_ephemeral(prev)
         self.current_group_id = None
         self._hide_typing()
         for w in self.friends.values(): w.set_selected(False)
@@ -1732,6 +2579,8 @@ class VeloApp(QMainWindow):
         if uid in self.friends:
             self.friends[uid].clear_unread()
         self.view_prof.setVisible(True)
+        self.conv_settings_btn.setVisible(True)
+        self.call_btn.setVisible(True)
         self.ch_av.setVisible(True)
         # Vide les messages tout de suite
         while self.msg_vbox.count() > 1:
@@ -1739,7 +2588,7 @@ class VeloApp(QMainWindow):
             if it.widget(): it.widget().deleteLater()
         # Charge le profil et l'historique en arrière-plan
         self._async(api_get, lambda u: self._fill_header(u, uid), f"/auth/users/{uid}", self.token)
-        self._async(api_get, lambda m: self._fill_history(m, uid), f"/chat/history/{self.user['id']}", self.token)
+        self._async(api_get, lambda m: self._fill_history(m, uid), f"/chat/conversation/{uid}", self.token)
 
     def _fill_header(self, u, uid):
         if not u or uid != self.recv_id: return
@@ -1757,7 +2606,6 @@ class VeloApp(QMainWindow):
 
     def _fill_history(self, msgs, uid):
         if msgs is None or uid != self.recv_id: return
-        msgs = [m for m in msgs if {m["sender_id"], m["receiver_id"]} == {self.user["id"], uid}]
         for i, m in enumerate(msgs):
             content = m["content"]
             outgoing = m["sender_id"] == self.user["id"]
@@ -1783,7 +2631,7 @@ class VeloApp(QMainWindow):
     # ── WebSocket ─────────────────────────────────────────
     def _connect_ws(self):
         self.ws = websocket.WebSocketApp(
-            f"ws://localhost:8000/chat/ws/{self.user['id']}",
+            f"{WS_URL}/chat/ws/{self.user['id']}",
             on_message=lambda ws, msg: self.sig_msg.emit(msg, 0))
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
@@ -1896,8 +2744,36 @@ class VeloApp(QMainWindow):
 
     # ── Dialogs ───────────────────────────────────────────
     def _open_settings(self):
-        d = SettingsDialog(self.token, self.user, self)
-        d.profile_updated.connect(self._on_updated); d.exec()
+        # Build the settings page fresh each time (reflects current data)
+        if self.settings_page is not None:
+            self.stack.removeWidget(self.settings_page)
+            self.settings_page.deleteLater()
+        self.settings_page = SettingsPage(self.token, self.user, self)
+        self.settings_page.profile_updated.connect(self._on_updated)
+        self.settings_page.notif_changed.connect(self._set_notifications)
+        self.settings_page.closed.connect(self._close_settings)
+        self.settings_page.logout_requested.connect(self._logout)
+        self.stack.addWidget(self.settings_page)
+        self.stack.setCurrentWidget(self.settings_page)
+
+    def _close_settings(self):
+        self.stack.setCurrentIndex(0)
+
+    def _logout(self):
+        # Ferme proprement et relance l'écran de login
+        try:
+            if self.ws: self.ws.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "group_ws", None): self.group_ws.close()
+        except Exception:
+            pass
+        global _RELOGIN
+        _RELOGIN = True
+        self.close()
+        QApplication.instance().quit()
+
     def _on_updated(self, u):
         self.user = u
         self.me_av.refresh(u.get("username", "?"), u.get("avatar_url", ""))
@@ -1966,8 +2842,15 @@ if __name__ == "__main__":
         QToolTip {{ background:{C['card']}; color:{C['text']}; border:1px solid {C['divider']};
             border-radius:6px; padding:4px 8px; font-family:'Segoe UI'; }}
     """)
-    login = LoginDialog()
-    if login.exec() == QDialog.DialogCode.Accepted:
+    # Boucle login → app → (logout) → login
+    while True:
+        _RELOGIN = False
+        login = LoginDialog()
+        if login.exec() != QDialog.DialogCode.Accepted:
+            break
         win = VeloApp(login.token, login.user)
         win.show()
-        sys.exit(app.exec())
+        app.exec()
+        if not _RELOGIN:
+            break
+    sys.exit(0)
