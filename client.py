@@ -1643,51 +1643,100 @@ class GifDownloader(QThread):
             self.loaded.emit(None)
 
 class CallDialog(QDialog):
+    remote_frame = pyqtSignal(object)  # signal thread-safe pour la vidéo reçue
     def __init__(self, name, avatar_url, incoming=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Call")
-        self.setFixedSize(320, 420)
+        self.setFixedSize(520, 560)
         self.setStyleSheet(f"background:{C['bg']};")
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.name = name; self.avatar_url = avatar_url
         self._build(name, avatar_url, incoming)
+        self.remote_frame.connect(self._show_remote_frame)
     def _build(self, name, avatar_url, incoming):
-        lo = QVBoxLayout(self); lo.setContentsMargins(0, 40, 0, 30); lo.setSpacing(0)
-        lo.addStretch()
-        av = Avatar(name, 120, avatar_url)
+        lo = QVBoxLayout(self); lo.setContentsMargins(0, 20, 0, 24); lo.setSpacing(0)
+        # Zone vidéo (cachée au départ)
+        self.video_label = QLabel()
+        self.video_label.setFixedSize(520, 300)
+        self.video_label.setStyleSheet("background:#000;")
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setVisible(False)
+        lo.addWidget(self.video_label)
+        # Bloc avatar + nom (visible si pas de vidéo)
+        self.info_block = QWidget()
+        ib = QVBoxLayout(self.info_block); ib.setSpacing(0)
+        ib.addStretch()
+        av = Avatar(name, 110, avatar_url)
         avw = QHBoxLayout(); avw.addStretch(); avw.addWidget(av); avw.addStretch()
-        lo.addLayout(avw)
-        lo.addSpacing(20)
+        ib.addLayout(avw)
+        ib.addSpacing(16)
         nm = QLabel(name); nm.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
         nm.setAlignment(Qt.AlignmentFlag.AlignCenter); nm.setStyleSheet(f"color:{C['text']};")
-        lo.addWidget(nm)
+        ib.addWidget(nm)
         self.status = QLabel("Incoming call…" if incoming else "Calling…")
         self.status.setFont(QFont("Segoe UI", 13))
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setStyleSheet(f"color:{C['text2']};margin-top:6px;")
-        lo.addWidget(self.status)
-        lo.addStretch()
-        # Boutons
-        btns = QHBoxLayout(); btns.setSpacing(30)
-        btns.addStretch()
+        ib.addWidget(self.status)
+        ib.addStretch()
+        lo.addWidget(self.info_block)
+        # Barre de boutons
+        btns = QHBoxLayout(); btns.setSpacing(16); btns.addStretch()
         if incoming:
             self.accept_btn = QPushButton("✓")
-            self.accept_btn.setFixedSize(64, 64)
+            self.accept_btn.setFixedSize(58, 58)
             self.accept_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             self.accept_btn.setStyleSheet(f"""QPushButton{{background:{C['green']};color:white;
-                border:none;border-radius:32px;font-size:26px;}}
+                border:none;border-radius:29px;font-size:24px;}}
                 QPushButton:hover{{background:#48b352;}}""")
             btns.addWidget(self.accept_btn)
+        # Bouton caméra
+        self.cam_btn = QPushButton("📷")
+        self.cam_btn.setFixedSize(52, 52)
+        self.cam_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.cam_btn.setStyleSheet(self._tool_style())
+        self.cam_btn.setVisible(not incoming)
+        btns.addWidget(self.cam_btn)
+        # Bouton écran
+        self.screen_btn = QPushButton("🖥")
+        self.screen_btn.setFixedSize(52, 52)
+        self.screen_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.screen_btn.setStyleSheet(self._tool_style())
+        self.screen_btn.setVisible(not incoming)
+        btns.addWidget(self.screen_btn)
+        # Raccrocher
         self.hangup_btn = QPushButton("✕")
-        self.hangup_btn.setFixedSize(64, 64)
+        self.hangup_btn.setFixedSize(58, 58)
         self.hangup_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.hangup_btn.setStyleSheet(f"""QPushButton{{background:{C['red']};color:white;
-            border:none;border-radius:32px;font-size:26px;}}
+            border:none;border-radius:29px;font-size:24px;}}
             QPushButton:hover{{background:#d04545;}}""")
         btns.addWidget(self.hangup_btn)
         btns.addStretch()
-        lo.addLayout(btns)
+        lo.addSpacing(16); lo.addLayout(btns)
+    def _tool_style(self):
+        return f"""QPushButton{{background:{C['card']};color:{C['text']};
+            border:none;border-radius:26px;font-size:20px;}}
+            QPushButton:hover{{background:{C['hover']};}}"""
     def set_status(self, text):
         self.status.setText(text)
+    def show_call_controls(self):
+        # Affiche les boutons cam/écran une fois connecté
+        self.cam_btn.setVisible(True)
+        self.screen_btn.setVisible(True)
+    def _show_remote_frame(self, img):
+        # img = ndarray RGB
+        from PyQt6.QtGui import QImage
+        h, w, ch = img.shape
+        bytes_per_line = ch * w
+        qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.video_label.width(), self.video_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self.video_label.setPixmap(pix)
+        if not self.video_label.isVisible():
+            self.video_label.setVisible(True)
+            self.info_block.setVisible(False)
 
 # ── Full-page Settings ────────────────────────────────────
 class SettingsPage(QWidget):
@@ -1952,6 +2001,33 @@ class VeloApp(QMainWindow):
         self._is_typing = False
         self.typing_bubble = None
 
+    def _toggle_camera(self):
+        if getattr(self, "_video_mode", None) == "camera":
+            # Couper la caméra
+            self.call_engine.stop_video()
+            self._video_mode = None
+            self.active_call_dialog.cam_btn.setStyleSheet(self.active_call_dialog._tool_style())
+        else:
+            self.call_engine.start_camera()
+            self._video_mode = "camera"
+            # Bouton actif (bleu)
+            self.active_call_dialog.cam_btn.setStyleSheet(f"""QPushButton{{background:{C['accent']};
+                color:white;border:none;border-radius:26px;font-size:20px;}}""")
+            # Désactive le style écran
+            self.active_call_dialog.screen_btn.setStyleSheet(self.active_call_dialog._tool_style())
+
+    def _toggle_screen(self):
+        if getattr(self, "_video_mode", None) == "screen":
+            self.call_engine.stop_video()
+            self._video_mode = None
+            self.active_call_dialog.screen_btn.setStyleSheet(self.active_call_dialog._tool_style())
+        else:
+            self.call_engine.start_screen()
+            self._video_mode = "screen"
+            self.active_call_dialog.screen_btn.setStyleSheet(f"""QPushButton{{background:{C['accent']};
+                color:white;border:none;border-radius:26px;font-size:20px;}}""")
+            self.active_call_dialog.cam_btn.setStyleSheet(self.active_call_dialog._tool_style())
+
     def _load_audio_config(self):
         import json, os
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_config.json")
@@ -1971,7 +2047,6 @@ class VeloApp(QMainWindow):
                 json.dump({"mic": mic_idx, "speaker": speaker_idx}, f)
         except Exception as e:
             print("audio config save error:", e)
-        # Applique tout de suite au moteur d'appel
         self.call_engine.mic_index = mic_idx
         self.call_engine.speaker_index = speaker_idx
 
@@ -1982,19 +2057,25 @@ class VeloApp(QMainWindow):
         avatar = ""
         self.active_call_dialog = CallDialog(name, avatar, incoming=False, parent=self)
         self.active_call_dialog.hangup_btn.clicked.connect(self._hangup_call)
+        self.active_call_dialog.cam_btn.clicked.connect(self._toggle_camera)
+        self.active_call_dialog.screen_btn.clicked.connect(self._toggle_screen)
+        self.call_engine.on_remote_video = lambda img: self.active_call_dialog.remote_frame.emit(img)
         self.call_engine.call(self.recv_id)
         self.active_call_dialog.show()
+        self._video_mode = None
 
     def _on_call_incoming(self, from_id):
-        # Récupère le nom de l'appelant
         name = "User"
         if from_id in self.friends:
             name = self.friends[from_id].uname
         self.active_call_dialog = CallDialog(name, "", incoming=True, parent=self)
         self.active_call_dialog.accept_btn.clicked.connect(self._accept_call)
         self.active_call_dialog.hangup_btn.clicked.connect(self._decline_call)
+        self.active_call_dialog.cam_btn.clicked.connect(self._toggle_camera)
+        self.active_call_dialog.screen_btn.clicked.connect(self._toggle_screen)
+        self.call_engine.on_remote_video = lambda img: self.active_call_dialog.remote_frame.emit(img)
         self.active_call_dialog.show()
-        # Son de sonnerie
+        self._video_mode = None
         try:
             import winsound
             winsound.MessageBeep(winsound.MB_ICONASTERISK)
@@ -2005,8 +2086,8 @@ class VeloApp(QMainWindow):
         self.call_engine.accept()
         if self.active_call_dialog:
             self.active_call_dialog.set_status("Connected")
-            # Cache le bouton accepter
             self.active_call_dialog.accept_btn.setVisible(False)
+            self.active_call_dialog.show_call_controls()
 
     def _decline_call(self):
         self.call_engine.decline()
@@ -2019,6 +2100,7 @@ class VeloApp(QMainWindow):
     def _on_call_connected(self):
         if self.active_call_dialog:
             self.active_call_dialog.set_status("Connected")
+            self.active_call_dialog.show_call_controls()
 
     def _on_call_ended(self):
         self._close_call_dialog()

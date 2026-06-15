@@ -20,6 +20,8 @@ from aiortc import MediaStreamTrack
 from av import AudioFrame
 import fractions
 import queue
+import cv2
+from av import AudioFrame, VideoFrame
 
 class MicTrack(MediaStreamTrack):
     """Capture le micro via sounddevice (par index) et le fournit à aiortc."""
@@ -40,6 +42,10 @@ class MicTrack(MediaStreamTrack):
             callback=self._cb,
         )
         self.stream.start()
+        self.video_track = None
+        self.video_sender = None
+        self.on_remote_video = None
+        self._remote_video_task = None
 
     def _cb(self, indata, frames, time, status):
         self._queue.put(indata.copy())
@@ -95,6 +101,75 @@ def default_mic_dshow():
     except Exception:
         pass
     return f"audio={mics[0]}"
+
+try:
+    from PIL import ImageGrab
+    HAS_IMAGEGRAB = True
+except Exception:
+    HAS_IMAGEGRAB = False
+
+
+class CameraTrack(MediaStreamTrack):
+    """Capture la webcam via OpenCV."""
+    kind = "video"
+
+    def __init__(self, device_index=0, fps=15):
+        super().__init__()
+        self.cap = cv2.VideoCapture(device_index, cv2.CAP_DSHOW)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.fps = fps
+        self._timestamp = 0
+
+    async def recv(self):
+        import asyncio
+        await asyncio.sleep(1 / self.fps)
+        ret, frame = self.cap.read()
+        if not ret:
+            # frame noire si échec
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        # BGR (OpenCV) → RGB
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        vframe = VideoFrame.from_ndarray(frame, format="rgb24")
+        vframe.pts = self._timestamp
+        vframe.time_base = fractions.Fraction(1, self.fps)
+        self._timestamp += 1
+        return vframe
+
+    def stop(self):
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+
+
+class ScreenTrack(MediaStreamTrack):
+    """Capture l'écran via PIL ImageGrab."""
+    kind = "video"
+
+    def __init__(self, fps=10):
+        super().__init__()
+        self.fps = fps
+        self._timestamp = 0
+
+    async def recv(self):
+        import asyncio
+        await asyncio.sleep(1 / self.fps)
+        img = ImageGrab.grab()
+        frame = np.array(img)  # RGB
+        # Réduit la taille pour la performance
+        h, w = frame.shape[:2]
+        scale = min(1.0, 1280 / w)
+        if scale < 1.0:
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        vframe = VideoFrame.from_ndarray(frame, format="rgb24")
+        vframe.pts = self._timestamp
+        vframe.time_base = fractions.Fraction(1, self.fps)
+        self._timestamp += 1
+        return vframe
+
+    def stop(self):
+        pass
 
 
 class AudioPlayer:
@@ -180,6 +255,59 @@ class CallEngine:
             return
         asyncio.run_coroutine_threadsafe(self._handle_signal(msg), self.loop)
 
+    async def _drain_video(self, track):
+        try:
+            while True:
+                frame = await track.recv()
+                if self.on_remote_video:
+                    img = frame.to_ndarray(format="rgb24")
+                    self.on_remote_video(img)
+        except Exception:
+            pass
+
+    def start_camera(self):
+        asyncio.run_coroutine_threadsafe(self._start_video("camera"), self.loop)
+
+    def start_screen(self):
+        asyncio.run_coroutine_threadsafe(self._start_video("screen"), self.loop)
+
+    def stop_video(self):
+        asyncio.run_coroutine_threadsafe(self._stop_video(), self.loop)
+
+    async def _start_video(self, source):
+        if not self.pc:
+            return
+        # Stoppe une éventuelle piste précédente
+        if self.video_track:
+            self.video_track.stop()
+            self.video_track = None
+        # Crée la nouvelle piste
+        if source == "camera":
+            self.video_track = CameraTrack()
+        else:
+            self.video_track = ScreenTrack()
+        # Ajoute ou remplace la piste
+        if self.video_sender is None:
+            self.video_sender = self.pc.addTrack(self.video_track)
+        else:
+            self.video_sender.replaceTrack(self.video_track)
+        # Renégociation
+        await self._renegotiate()
+
+    async def _stop_video(self):
+        if self.video_track:
+            self.video_track.stop()
+            self.video_track = None
+        if self.video_sender:
+            self.video_sender.replaceTrack(None)
+        await self._renegotiate()
+
+    async def _renegotiate(self):
+        # Recrée une offer et l'envoie
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
+        self._send({"type": "renegotiate", "sdp": self.pc.localDescription.sdp})
+
     async def _handle_signal(self, msg):
         t = msg.get("type")
         if t == "call_invite":
@@ -211,6 +339,16 @@ class CallEngine:
         elif t == "call_unavailable":
             if self.on_unavailable:
                 self.on_unavailable()
+        elif t == "renegotiate":
+            # L'autre a ajouté/retiré une piste → on applique et on répond
+            offer = RTCSessionDescription(sdp=msg["sdp"], type="offer")
+            await self.pc.setRemoteDescription(offer)
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
+            self._send({"type": "renegotiate_answer", "sdp": self.pc.localDescription.sdp})
+        elif t == "renegotiate_answer":
+            answer = RTCSessionDescription(sdp=msg["sdp"], type="answer")
+            await self.pc.setRemoteDescription(answer)
 
     def _send(self, msg):
         msg["to"] = self.peer_id
@@ -230,6 +368,8 @@ class CallEngine:
                 self.audio_out = AudioPlayer(device=self.speaker_index)
                 self.audio_out.start()
                 self._play_task = asyncio.ensure_future(self._drain(track))
+            elif track.kind == "video":
+                self._remote_video_task = asyncio.ensure_future(self._drain_video(track))
 
         @pc.on("connectionstatechange")
         async def on_state():
