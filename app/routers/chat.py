@@ -71,7 +71,6 @@ async def group_websocket(websocket: WebSocket, group_id: int, user_id: int):
     try:
         while True:
             data = await websocket.receive_text()
-            # Vérifie que l'utilisateur est toujours membre
             from app.models.group import GroupMember
             async with AsyncSessionLocal() as db:
                 res = await db.execute(
@@ -82,7 +81,6 @@ async def group_websocket(websocket: WebSocket, group_id: int, user_id: int):
                 )
                 is_member = res.scalar_one_or_none() is not None
             if not is_member:
-                # Plus membre → on ferme la connexion
                 await websocket.close()
                 group_manager.disconnect(group_id, user_id)
                 break
@@ -94,11 +92,13 @@ async def group_websocket(websocket: WebSocket, group_id: int, user_id: int):
                 gm = GroupMessage(group_id=group_id, sender_id=user_id, content=data)
                 db.add(gm)
                 await db.commit()
+                await db.refresh(gm)
+                new_id = gm.id
             async with AsyncSessionLocal() as db:
                 res = await db.execute(select(User).where(User.id == user_id))
                 u = res.scalar_one_or_none()
                 sender_name = u.username if u else "?"
-            await group_manager.broadcast(group_id, f"{sender_name}:{data}")
+            await group_manager.broadcast(group_id, f"{sender_name}|{new_id}:{data}")
     except Exception as e:
         print(f"Group WS error: {e}")
         group_manager.disconnect(group_id, user_id)

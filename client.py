@@ -2364,8 +2364,10 @@ class VeloApp(QMainWindow):
     def _check_kicked(self, members, gid):
         if self.current_group_id != gid:
             return
-        if members is None:
-            members = []
+        # Si la requête a échoué (None) ou renvoie vide (latence/timeout Render),
+        # on NE kick PAS — sinon faux positif.
+        if not members:
+            return
         my_ids = [m["user_id"] for m in members]
         if self.user["id"] not in my_ids:
             # On a été kické/banni
@@ -2389,15 +2391,40 @@ class VeloApp(QMainWindow):
                 self.group_ws.close()
             except Exception:
                 pass
-        self.group_ws = websocket.WebSocketApp(
+        new_ws = websocket.WebSocketApp(
             f"{WS_URL}/chat/group_ws/{gid}/{self.user['id']}",
             on_message=lambda ws, msg: self.sig_group_msg.emit(msg),
-            on_close=lambda ws, code, reason: self.sig_group_closed.emit(gid))
-        threading.Thread(target=self.group_ws.run_forever, daemon=True).start()
+            on_close=lambda ws, code, reason: self._handle_group_close(ws, gid))
+        self.group_ws = new_ws
+        threading.Thread(target=new_ws.run_forever, daemon=True).start()
+
+    def _handle_group_close(self, ws, gid):
+        # Si ce n'est plus le WebSocket actif, fermeture volontaire → ignorer
+        if ws is not self.group_ws:
+            return
+        self.sig_group_closed.emit(gid)
 
     def _on_group_incoming(self, message):
         if ":" not in message: return
         sender_name, content = message.split(":", 1)
+        # Signaux edit/delete de groupe
+        if sender_name == "__SIGNAL__":
+            if content.startswith("[EDIT]"):
+                payload = content[len("[EDIT]"):]
+                parts = payload.split("|", 1)
+                if len(parts) == 2:
+                    try:
+                        mid = int(parts[0])
+                        self.sig_msg_edited.emit(mid, parts[1])
+                    except ValueError:
+                        pass
+            elif content.startswith("[DELETE]"):
+                try:
+                    mid = int(content[len("[DELETE]"):])
+                    self.sig_msg_deleted.emit(mid)
+                except ValueError:
+                    pass
+            return
         if sender_name == self.user["username"]:
             return
         if content.startswith("[FILE]"):
@@ -2438,6 +2465,7 @@ class VeloApp(QMainWindow):
         self.ch_sub.setText(lock)
 
     def _fill_group_history(self, msgs, gid):
+        self._bubbles.clear()
         for i, m in enumerate(msgs):
             outgoing = m["sender_id"] == self.user["id"]
             content = m["content"]
@@ -2446,8 +2474,49 @@ class VeloApp(QMainWindow):
                 if w: self.msg_vbox.insertWidget(i, w)
             else:
                 text = content if outgoing else f"{m['sender_name']}: {content}"
-                self.msg_vbox.insertWidget(i, Bubble(text, outgoing))
+                b = self._make_group_bubble(text, outgoing, gid,
+                                            msg_id=m.get("id"), edited=m.get("edited", False),
+                                            raw_content=content)
+                self.msg_vbox.insertWidget(i, b)
         self._scroll_bottom()
+
+    def _make_group_bubble(self, text, outgoing, gid, msg_id=None, edited=False, raw_content=""):
+        b = Bubble(text, outgoing, msg_id=msg_id, edited=edited)
+        b._raw_content = raw_content  # contenu sans le préfixe "nom:"
+        if msg_id is not None:
+            self._bubbles[msg_id] = b
+            if outgoing:
+                b.edit_requested.connect(lambda mid, _t, g=gid: self._on_group_edit_requested(mid, g))
+                b.delete_requested.connect(lambda mid, g=gid: self._on_group_delete_requested(mid, g))
+        return b
+
+    def _on_group_edit_requested(self, msg_id, gid):
+        from PyQt6.QtWidgets import QInputDialog
+        current = ""
+        if msg_id in self._bubbles:
+            current = getattr(self._bubbles[msg_id], "_raw_content", "")
+        new_text, ok = QInputDialog.getText(self, "Edit message", "New text:", text=current)
+        if ok and new_text.strip() and new_text != current:
+            self._async(api_post, lambda r: None, f"/groups/{gid}/edit_message", self.token,
+                        {"message_id": msg_id, "new_content": new_text.strip()})
+            if msg_id in self._bubbles:
+                self._bubbles[msg_id].mark_edited(new_text.strip())
+            # Diffuse aux autres via le WS de groupe
+            if self.group_ws:
+                try:
+                    self.group_ws.send(f"[EDIT]{msg_id}|{new_text.strip()}")
+                except Exception:
+                    pass
+
+    def _on_group_delete_requested(self, msg_id, gid):
+        self._async(api_post, lambda r: None, f"/groups/{gid}/delete_message", self.token,
+                    {"message_id": msg_id})
+        self._apply_delete(msg_id)
+        if self.group_ws:
+            try:
+                self.group_ws.send(f"[DELETE]{msg_id}")
+            except Exception:
+                pass
 
     def _load_groups(self):
         self._async(api_get, self._fill_groups, "/groups/my", self.token)
@@ -2703,6 +2772,12 @@ class VeloApp(QMainWindow):
         if prev and prev != uid:
             self._clear_ephemeral(prev)
         self.current_group_id = None
+        # Ferme proprement le WS de groupe (pour ne pas déclencher de faux kick)
+        if self.group_ws:
+            old = self.group_ws
+            self.group_ws = None
+            try: old.close()
+            except Exception: pass
         self._hide_typing()
         for w in self.friends.values(): w.set_selected(False)
         if uid in self.friends: self.friends[uid].set_selected(True)
@@ -2744,6 +2819,23 @@ class VeloApp(QMainWindow):
                 b.edit_requested.connect(self._on_edit_requested)
                 b.delete_requested.connect(self._on_delete_requested)
         return b
+
+    def _assign_sent_id(self, new_id):
+        b = getattr(self, "_pending_sent_bubble", None)
+        if b is None:
+            return
+        b.msg_id = new_id
+        self._bubbles[new_id] = b
+        # Active le clic-droit edit/delete maintenant qu'on a l'id
+        b.lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        try:
+            b.lbl.customContextMenuRequested.disconnect()
+        except Exception:
+            pass
+        b.lbl.customContextMenuRequested.connect(b._menu)
+        b.edit_requested.connect(self._on_edit_requested)
+        b.delete_requested.connect(self._on_delete_requested)
+        self._pending_sent_bubble = None
 
     def _on_edit_requested(self, msg_id, current_text):
         from PyQt6.QtWidgets import QInputDialog
@@ -2816,7 +2908,6 @@ class VeloApp(QMainWindow):
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
     def _on_incoming(self, raw, _):
-        # Accusé de lecture
         if raw.startswith("[READ]"):
             reader_id = int(raw.replace("[READ]", ""))
             if reader_id == self.recv_id and self.last_status_label:
@@ -2840,6 +2931,17 @@ class VeloApp(QMainWindow):
                 self.sig_msg_deleted.emit(mid)
             except ValueError:
                 pass
+            return
+        # ID du message qu'on vient d'envoyer (pour edit/delete immédiat)
+        if raw.startswith("[NEWID]"):
+            payload = raw[len("[NEWID]"):]
+            parts = payload.split("|", 1)
+            if len(parts) == 2:
+                try:
+                    new_id = int(parts[0])
+                    self._assign_sent_id(new_id)
+                except ValueError:
+                    pass
             return
         if ":" not in raw:
             return
@@ -2930,7 +3032,9 @@ class VeloApp(QMainWindow):
         if not self.recv_id or not self.ws: return
         try:
             self.ws.send(f"{self.recv_id}:{text}")
-            self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, Bubble(text, True))
+            bubble = self._make_bubble(text, True, msg_id=None)
+            self._pending_sent_bubble = bubble  # pour recevoir son id via [NEWID]
+            self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, bubble)
             self.inp.clear()
             self._set_msg_status("✓ Delivered")
             self._scroll_bottom()
