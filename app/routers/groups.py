@@ -158,11 +158,11 @@ async def group_members(
         u = ures.scalar_one_or_none()
         if u:
             out.append({
-                "id": m.id,
-                "sender_id": m.sender_id,
-                "sender_name": u.username if u else "?",
-                "content": m.content,
-                "edited": getattr(m, "edited", False),
+                "user_id": m.user_id,
+                "role": m.role,
+                "username": u.username,
+                "slug": u.slug or "",
+                "avatar_url": u.avatar_url or "",
             })
     return out
 
@@ -184,9 +184,11 @@ async def group_history(
         ures = await db.execute(select(User).where(User.id == m.sender_id))
         u = ures.scalar_one_or_none()
         out.append({
+            "id": m.id,
             "sender_id": m.sender_id,
             "sender_name": u.username if u else "?",
             "content": m.content,
+            "edited": getattr(m, "edited", False),
         })
     return out
 
