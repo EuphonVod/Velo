@@ -2628,11 +2628,23 @@ class VeloApp(QMainWindow):
             self.msg_vbox.insertWidget(i, Bubble(m["content"], m["sender_id"] == self.user["id"]))
         self._scroll_bottom()
 
-    # ── WebSocket ─────────────────────────────────────────
+    #websocket
     def _connect_ws(self):
+        def on_error(ws, error):
+            print("WS ERROR:", error)
+
+        def on_close(ws, code, reason):
+            print(f"WS CLOSED: code={code}, reason={reason}")
+
+        def on_open(ws):
+            print("WS CONNECTED ✓")
+
         self.ws = websocket.WebSocketApp(
             f"{WS_URL}/chat/ws/{self.user['id']}",
-            on_message=lambda ws, msg: self.sig_msg.emit(msg, 0))
+            on_message=lambda ws, msg: self.sig_msg.emit(msg, 0),
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open)
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
     def _on_incoming(self, raw, _):

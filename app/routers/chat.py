@@ -22,6 +22,9 @@ from fastapi.responses import FileResponse
 
 router = APIRouter()
 
+class MarkReadData(BaseModel):
+    other_user_id: int
+
 UPLOAD_DIR = "uploads_files"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -208,6 +211,3 @@ class GroupConnectionManager:
                 await ws.send_text(message)
 
 group_manager = GroupConnectionManager()
-
-class MarkReadData(BaseModel):
-    other_user_id: int
