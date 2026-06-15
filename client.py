@@ -288,19 +288,54 @@ def api_upload(token, filepath):
 
 # ── Message bubble ────────────────────────────────────────
 class Bubble(QWidget):
-    def __init__(self, text, outgoing, parent=None):
+    edit_requested = pyqtSignal(int, str)   # (message_id, current_text)
+    delete_requested = pyqtSignal(int)      # (message_id)
+
+    def __init__(self, text, outgoing, msg_id=None, edited=False, parent=None):
         super().__init__(parent)
+        self.msg_id = msg_id
+        self.outgoing = outgoing
+        self._raw_text = text
         lo = QHBoxLayout(self); lo.setContentsMargins(16, 2, 16, 2)
-        lbl = QLabel(text); lbl.setWordWrap(True)
-        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lbl.setFont(QFont("Segoe UI", 12))
-        lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
-        lbl.setMaximumWidth(520)
+        self.lbl = QLabel(); self.lbl.setWordWrap(True)
+        self.lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.lbl.setFont(QFont("Segoe UI", 12))
+        self.lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self.lbl.setMaximumWidth(520)
         bg = C["msg_out"] if outgoing else C["msg_in"]
         br = "13px 13px 3px 13px" if outgoing else "13px 13px 13px 3px"
-        lbl.setStyleSheet(f"QLabel{{background:{bg};color:{C['text']};border-radius:{br};padding:9px 14px;}}")
-        if outgoing: lo.addStretch(); lo.addWidget(lbl)
-        else: lo.addWidget(lbl); lo.addStretch()
+        self.lbl.setStyleSheet(f"QLabel{{background:{bg};color:{C['text']};border-radius:{br};padding:9px 14px;}}")
+        self._set_text(text, edited)
+        # Clic droit pour modifier/supprimer (seulement ses propres messages)
+        if outgoing and msg_id is not None:
+            self.lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.lbl.customContextMenuRequested.connect(self._menu)
+        if outgoing: lo.addStretch(); lo.addWidget(self.lbl)
+        else: lo.addWidget(self.lbl); lo.addStretch()
+
+    def _set_text(self, text, edited):
+        self._raw_text = text
+        if edited:
+            self.lbl.setText(f"{text}  ")
+            # petit suffixe "(modifié)" en plus discret
+            self.lbl.setText(f"{text}   (edited)")
+        else:
+            self.lbl.setText(text)
+
+    def mark_edited(self, new_text):
+        self._set_text(new_text, True)
+
+    def _menu(self, pos):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
+                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
+            QMenu::item {{padding:8px 18px;border-radius:6px;}}
+            QMenu::item:selected {{background:{C['hover']};}}
+        """)
+        menu.addAction("✏  Edit", lambda: self.edit_requested.emit(self.msg_id, self._raw_text))
+        menu.addAction("🗑  Delete", lambda: self.delete_requested.emit(self.msg_id))
+        menu.exec(self.lbl.mapToGlobal(pos))
 
 
 # ── Contact / friend row ──────────────────────────────────
@@ -1644,6 +1679,7 @@ class GifDownloader(QThread):
 
 class CallDialog(QDialog):
     remote_frame = pyqtSignal(object)  # signal thread-safe pour la vidéo reçue
+    video_stopped = pyqtSignal()
     def __init__(self, name, avatar_url, incoming=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Call")
@@ -1653,6 +1689,7 @@ class CallDialog(QDialog):
         self.name = name; self.avatar_url = avatar_url
         self._build(name, avatar_url, incoming)
         self.remote_frame.connect(self._show_remote_frame)
+        self.video_stopped.connect(self._hide_remote_video)
     def _build(self, name, avatar_url, incoming):
         lo = QVBoxLayout(self); lo.setContentsMargins(0, 20, 0, 24); lo.setSpacing(0)
         # Zone vidéo (cachée au départ)
@@ -1714,6 +1751,11 @@ class CallDialog(QDialog):
         btns.addWidget(self.hangup_btn)
         btns.addStretch()
         lo.addSpacing(16); lo.addLayout(btns)
+
+    def _hide_remote_video(self):
+        self.video_label.clear()
+        self.video_label.setVisible(False)
+        self.info_block.setVisible(True)
     def _tool_style(self):
         return f"""QPushButton{{background:{C['card']};color:{C['text']};
             border:none;border-radius:26px;font-size:20px;}}
@@ -1951,6 +1993,8 @@ class VeloApp(QMainWindow):
     sig_call_connected = pyqtSignal()
     sig_call_ended = pyqtSignal()
     sig_call_unavailable = pyqtSignal()
+    sig_msg_edited = pyqtSignal(int, str)    # (message_id, new_text)
+    sig_msg_deleted = pyqtSignal(int)        # (message_id)
     def __init__(self, token, user):
         super().__init__()
         self.token = token
@@ -1960,6 +2004,7 @@ class VeloApp(QMainWindow):
         self.groups = {}
         self.current_group_id = None
         self.ws = None
+        self._bubbles = {}   # msg_id -> Bubble (pour edit/delete)
         _audio_cfg = self._load_audio_config()
         self.call_engine = CallEngine(
             WS_URL,
@@ -1991,6 +2036,8 @@ class VeloApp(QMainWindow):
         self.sig_call_connected.connect(self._on_call_connected)
         self.sig_call_ended.connect(self._on_call_ended)
         self.sig_call_unavailable.connect(self._on_call_unavailable)
+        self.sig_msg_edited.connect(self._apply_edit)
+        self.sig_msg_deleted.connect(self._apply_delete)
         self.group_ws = None
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._periodic_refresh)
@@ -2002,6 +2049,7 @@ class VeloApp(QMainWindow):
         self.typing_bubble = None
 
     def _toggle_camera(self):
+        print("[CAM] _toggle_camera appelé")
         if getattr(self, "_video_mode", None) == "camera":
             # Couper la caméra
             self.call_engine.stop_video()
@@ -2060,6 +2108,7 @@ class VeloApp(QMainWindow):
         self.active_call_dialog.cam_btn.clicked.connect(self._toggle_camera)
         self.active_call_dialog.screen_btn.clicked.connect(self._toggle_screen)
         self.call_engine.on_remote_video = lambda img: self.active_call_dialog.remote_frame.emit(img)
+        self.call_engine.on_video_stopped = lambda: self.active_call_dialog.video_stopped.emit()
         self.call_engine.call(self.recv_id)
         self.active_call_dialog.show()
         self._video_mode = None
@@ -2074,6 +2123,7 @@ class VeloApp(QMainWindow):
         self.active_call_dialog.cam_btn.clicked.connect(self._toggle_camera)
         self.active_call_dialog.screen_btn.clicked.connect(self._toggle_screen)
         self.call_engine.on_remote_video = lambda img: self.active_call_dialog.remote_frame.emit(img)
+        self.call_engine.on_video_stopped = lambda: self.active_call_dialog.video_stopped.emit()
         self.active_call_dialog.show()
         self._video_mode = None
         try:
@@ -2686,8 +2736,43 @@ class VeloApp(QMainWindow):
         else:
             self._set_can_send(True)
 
+    def _make_bubble(self, content, outgoing, msg_id=None, edited=False):
+        b = Bubble(content, outgoing, msg_id=msg_id, edited=edited)
+        if msg_id is not None:
+            self._bubbles[msg_id] = b
+            if outgoing:
+                b.edit_requested.connect(self._on_edit_requested)
+                b.delete_requested.connect(self._on_delete_requested)
+        return b
+
+    def _on_edit_requested(self, msg_id, current_text):
+        from PyQt6.QtWidgets import QInputDialog
+        new_text, ok = QInputDialog.getText(self, "Edit message", "New text:", text=current_text)
+        if ok and new_text.strip() and new_text != current_text:
+            self._async(api_post, lambda r: None, "/chat/edit_message", self.token,
+                        {"message_id": msg_id, "new_content": new_text.strip()})
+            # Applique localement tout de suite
+            if msg_id in self._bubbles:
+                self._bubbles[msg_id].mark_edited(new_text.strip())
+
+    def _on_delete_requested(self, msg_id):
+        self._async(api_post, lambda r: None, "/chat/delete_message", self.token,
+                    {"message_id": msg_id})
+        self._apply_delete(msg_id)
+
+    def _apply_edit(self, msg_id, new_text):
+        if msg_id in self._bubbles:
+            self._bubbles[msg_id].mark_edited(new_text)
+
+    def _apply_delete(self, msg_id):
+        if msg_id in self._bubbles:
+            w = self._bubbles[msg_id]
+            w.deleteLater()
+            del self._bubbles[msg_id]
+
     def _fill_history(self, msgs, uid):
         if msgs is None or uid != self.recv_id: return
+        self._bubbles.clear()
         for i, m in enumerate(msgs):
             content = m["content"]
             outgoing = m["sender_id"] == self.user["id"]
@@ -2700,7 +2785,8 @@ class VeloApp(QMainWindow):
                 w = self._parse_attachment(content, outgoing)
                 if w: self.msg_vbox.insertWidget(i, w)
             else:
-                self.msg_vbox.insertWidget(i, Bubble(content, outgoing))
+                self.msg_vbox.insertWidget(i, self._make_bubble(
+                    content, outgoing, msg_id=m.get("id"), edited=m.get("edited", False)))
         self._scroll_bottom()
 
     def _load_history(self, uid):
@@ -2735,6 +2821,25 @@ class VeloApp(QMainWindow):
             reader_id = int(raw.replace("[READ]", ""))
             if reader_id == self.recv_id and self.last_status_label:
                 self._set_msg_status("✓✓ Read", read=True)
+            return
+        # Message modifié
+        if raw.startswith("[EDIT]"):
+            payload = raw[len("[EDIT]"):]
+            parts = payload.split("|", 1)
+            if len(parts) == 2:
+                try:
+                    mid = int(parts[0])
+                    self.sig_msg_edited.emit(mid, parts[1])
+                except ValueError:
+                    pass
+            return
+        # Message supprimé
+        if raw.startswith("[DELETE]"):
+            try:
+                mid = int(raw[len("[DELETE]"):])
+                self.sig_msg_deleted.emit(mid)
+            except ValueError:
+                pass
             return
         if ":" not in raw:
             return

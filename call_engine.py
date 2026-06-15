@@ -215,21 +215,30 @@ class AudioPlayer:
             pass
 
 
+
 class CallEngine:
     def __init__(self, base_ws_url, my_id, mic_index=None, speaker_index=None):
         self.base_ws_url = base_ws_url
         self.my_id = my_id
-        self.mic_index = mic_index        # index sounddevice du micro
-        self.speaker_index = speaker_index  # index sounddevice du HP
+        self.mic_index = mic_index
+        self.speaker_index = speaker_index
         self.mic_track = None
+        self.video_track = None
+        self.video_sender = None
+        self.on_remote_video = None
+        self._remote_video_task = None
+        self.on_video_stopped = None
         self.pc = None
         self.signaling = None
         self.peer_id = None
         self.loop = None
-        self.player = None          # MediaPlayer (micro)
-        self.audio_out = None       # AudioPlayer (sortie)
+        self.audio_out = None
         self._pending_offer = None
         self._play_task = None
+        # Perfect negotiation
+        self._polite = False          # l'appelé est "polite"
+        self._making_offer = False
+        self._ignore_offer = False
         # Callbacks
         self.on_incoming = None
         self.on_connected = None
@@ -244,7 +253,12 @@ class CallEngine:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         url = f"{self.base_ws_url}/calls/ws/{self.my_id}"
-        self.signaling = ws_client.WebSocketApp(url, on_message=self._on_signal)
+        self.signaling = ws_client.WebSocketApp(
+            url,
+            on_message=self._on_signal,
+            on_open=lambda ws: print(f"[CALL] Signaling connecté (user {self.my_id})"),
+            on_error=lambda ws, e: print(f"[CALL] Signaling erreur: {e}"),
+            on_close=lambda ws, c, r: print(f"[CALL] Signaling fermé: {c}"))
         threading.Thread(target=self.signaling.run_forever, daemon=True).start()
         self.loop.run_forever()
 
@@ -254,101 +268,6 @@ class CallEngine:
         except Exception:
             return
         asyncio.run_coroutine_threadsafe(self._handle_signal(msg), self.loop)
-
-    async def _drain_video(self, track):
-        try:
-            while True:
-                frame = await track.recv()
-                if self.on_remote_video:
-                    img = frame.to_ndarray(format="rgb24")
-                    self.on_remote_video(img)
-        except Exception:
-            pass
-
-    def start_camera(self):
-        asyncio.run_coroutine_threadsafe(self._start_video("camera"), self.loop)
-
-    def start_screen(self):
-        asyncio.run_coroutine_threadsafe(self._start_video("screen"), self.loop)
-
-    def stop_video(self):
-        asyncio.run_coroutine_threadsafe(self._stop_video(), self.loop)
-
-    async def _start_video(self, source):
-        if not self.pc:
-            return
-        # Stoppe une éventuelle piste précédente
-        if self.video_track:
-            self.video_track.stop()
-            self.video_track = None
-        # Crée la nouvelle piste
-        if source == "camera":
-            self.video_track = CameraTrack()
-        else:
-            self.video_track = ScreenTrack()
-        # Ajoute ou remplace la piste
-        if self.video_sender is None:
-            self.video_sender = self.pc.addTrack(self.video_track)
-        else:
-            self.video_sender.replaceTrack(self.video_track)
-        # Renégociation
-        await self._renegotiate()
-
-    async def _stop_video(self):
-        if self.video_track:
-            self.video_track.stop()
-            self.video_track = None
-        if self.video_sender:
-            self.video_sender.replaceTrack(None)
-        await self._renegotiate()
-
-    async def _renegotiate(self):
-        # Recrée une offer et l'envoie
-        offer = await self.pc.createOffer()
-        await self.pc.setLocalDescription(offer)
-        self._send({"type": "renegotiate", "sdp": self.pc.localDescription.sdp})
-
-    async def _handle_signal(self, msg):
-        t = msg.get("type")
-        if t == "call_invite":
-            self.peer_id = msg["from"]
-            self._pending_offer = msg.get("sdp")
-            if self.on_incoming:
-                self.on_incoming(msg["from"])
-        elif t == "call_answer":
-            answer = RTCSessionDescription(sdp=msg["sdp"], type="answer")
-            await self.pc.setRemoteDescription(answer)
-            if self.on_connected:
-                self.on_connected()
-        elif t == "ice":
-            if self.pc and msg.get("candidate"):
-                try:
-                    c = msg["candidate"]
-                    cand = RTCIceCandidate(
-                        sdpMid=c["sdpMid"],
-                        sdpMLineIndex=c["sdpMLineIndex"],
-                        candidate=c["candidate"],
-                    )
-                    await self.pc.addIceCandidate(cand)
-                except Exception as e:
-                    print("ICE error:", e)
-        elif t == "call_end":
-            await self._cleanup()
-            if self.on_ended:
-                self.on_ended()
-        elif t == "call_unavailable":
-            if self.on_unavailable:
-                self.on_unavailable()
-        elif t == "renegotiate":
-            # L'autre a ajouté/retiré une piste → on applique et on répond
-            offer = RTCSessionDescription(sdp=msg["sdp"], type="offer")
-            await self.pc.setRemoteDescription(offer)
-            answer = await self.pc.createAnswer()
-            await self.pc.setLocalDescription(answer)
-            self._send({"type": "renegotiate_answer", "sdp": self.pc.localDescription.sdp})
-        elif t == "renegotiate_answer":
-            answer = RTCSessionDescription(sdp=msg["sdp"], type="answer")
-            await self.pc.setRemoteDescription(answer)
 
     def _send(self, msg):
         msg["to"] = self.peer_id
@@ -373,6 +292,7 @@ class CallEngine:
 
         @pc.on("connectionstatechange")
         async def on_state():
+            print(f"[CALL] État connexion: {pc.connectionState}")
             if pc.connectionState in ("failed", "closed", "disconnected"):
                 await self._cleanup()
                 if self.on_ended:
@@ -380,7 +300,6 @@ class CallEngine:
         return pc
 
     async def _drain(self, track):
-        """Lit les frames du micro distant et les joue."""
         try:
             while True:
                 frame = await track.recv()
@@ -388,6 +307,16 @@ class CallEngine:
                 if arr.dtype != np.int16:
                     arr = arr.astype(np.int16)
                 self.audio_out.feed(arr.tobytes())
+        except Exception:
+            pass
+
+    async def _drain_video(self, track):
+        try:
+            while True:
+                frame = await track.recv()
+                if self.on_remote_video:
+                    img = frame.to_ndarray(format="rgb24")
+                    self.on_remote_video(img)
         except Exception:
             pass
 
@@ -399,9 +328,130 @@ class CallEngine:
             print("mic open error:", e)
             self.mic_track = None
 
+    # ── Vidéo (toggle en cours d'appel) ───────────────────
+    def start_camera(self):
+        asyncio.run_coroutine_threadsafe(self._start_video("camera"), self.loop)
+
+    def start_screen(self):
+        asyncio.run_coroutine_threadsafe(self._start_video("screen"), self.loop)
+
+    def stop_video(self):
+        asyncio.run_coroutine_threadsafe(self._stop_video(), self.loop)
+
+    async def _start_video(self, source):
+        if not self.pc:
+            return
+        try:
+            if self.video_track:
+                self.video_track.stop()
+                self.video_track = None
+            if source == "camera":
+                self.video_track = CameraTrack()
+            else:
+                self.video_track = ScreenTrack()
+            if self.video_sender is None:
+                self.video_sender = self.pc.addTrack(self.video_track)
+            else:
+                self.video_sender.replaceTrack(self.video_track)
+            await self._negotiate()
+        except Exception as e:
+            import traceback
+            print("[VIDEO] ERREUR:", e)
+            traceback.print_exc()
+
+    async def _stop_video(self):
+        try:
+            if self.video_track:
+                self.video_track.stop()
+                self.video_track = None
+            if self.video_sender:
+                self.video_sender.replaceTrack(None)
+            self._send({"type": "video_stopped"})
+            await self._negotiate()
+        except Exception as e:
+            print("[VIDEO] stop error:", e)
+
+    # ── Perfect negotiation ───────────────────────────────
+    async def _negotiate(self):
+        """Initie une (re)négociation de façon sûre."""
+        if not self.pc:
+            return
+        try:
+            self._making_offer = True
+            offer = await self.pc.createOffer()
+            await self.pc.setLocalDescription(offer)
+            self._send({"type": "offer", "sdp": self.pc.localDescription.sdp})
+        except Exception as e:
+            print("[NEG] offer error:", e)
+        finally:
+            self._making_offer = False
+
+    async def _handle_signal(self, msg):
+        t = msg.get("type")
+
+        if t == "call_invite":
+            # Appel entrant : on est l'appelé (polite)
+            self.peer_id = msg["from"]
+            self._pending_offer = msg.get("sdp")
+            self._polite = True
+            if self.on_incoming:
+                self.on_incoming(msg["from"])
+
+        elif t == "call_answer":
+            answer = RTCSessionDescription(sdp=msg["sdp"], type="answer")
+            await self.pc.setRemoteDescription(answer)
+            if self.on_connected:
+                self.on_connected()
+
+        elif t == "offer":
+            # (Re)négociation entrante avec gestion du "glare"
+            if not self.pc:
+                return
+            offer_collision = self._making_offer or self.pc.signalingState != "stable"
+            self._ignore_offer = (not self._polite) and offer_collision
+            if self._ignore_offer:
+                print("[NEG] offre ignorée (glare, impolite)")
+                return
+            desc = RTCSessionDescription(sdp=msg["sdp"], type="offer")
+            await self.pc.setRemoteDescription(desc)
+            answer = await self.pc.createAnswer()
+            await self.pc.setLocalDescription(answer)
+            self._send({"type": "answer", "sdp": self.pc.localDescription.sdp})
+
+        elif t == "answer":
+            if self.pc and self.pc.signalingState == "have-local-offer":
+                answer = RTCSessionDescription(sdp=msg["sdp"], type="answer")
+                await self.pc.setRemoteDescription(answer)
+
+        elif t == "ice":
+            if self.pc and msg.get("candidate"):
+                try:
+                    c = msg["candidate"]
+                    cand = RTCIceCandidate(
+                        sdpMid=c["sdpMid"],
+                        sdpMLineIndex=c["sdpMLineIndex"],
+                        candidate=c["candidate"],
+                    )
+                    await self.pc.addIceCandidate(cand)
+                except Exception as e:
+                    print("ICE error:", e)
+
+        elif t == "call_end":
+            await self._cleanup()
+            if self.on_ended:
+                self.on_ended()
+
+        elif t == "call_unavailable":
+            if self.on_unavailable:
+                self.on_unavailable()
+        elif t == "video_stopped":
+            if self.on_video_stopped:
+                self.on_video_stopped()
+
     # ── API publique ──────────────────────────────────────
     def call(self, peer_id):
         self.peer_id = peer_id
+        self._polite = False  # l'appelant est impolite
         asyncio.run_coroutine_threadsafe(self._do_call(), self.loop)
 
     async def _do_call(self):
@@ -444,13 +494,23 @@ class CallEngine:
         except Exception:
             pass
         try:
-            if self.audio_out:
-                self.audio_out.stop()
+            if self._remote_video_task:
+                self._remote_video_task.cancel()
         except Exception:
             pass
         try:
-            if self.player:
-                self.player = None
+            if self.video_track:
+                self.video_track.stop()
+        except Exception:
+            pass
+        try:
+            if self.mic_track:
+                self.mic_track.stop()
+        except Exception:
+            pass
+        try:
+            if self.audio_out:
+                self.audio_out.stop()
         except Exception:
             pass
         try:
@@ -459,4 +519,9 @@ class CallEngine:
         except Exception:
             pass
         self.pc = None
-        self.peer_id = None
+        self.video_track = None
+        self.video_sender = None
+        self.mic_track = None
+        self._polite = False
+        self._making_offer = False
+        self._ignore_offer = False

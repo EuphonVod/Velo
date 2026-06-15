@@ -83,7 +83,9 @@ async def group_websocket(websocket: WebSocket, group_id: int, user_id: int):
                 await websocket.close()
                 group_manager.disconnect(group_id, user_id)
                 break
-            # Sauvegarde et diffuse le message
+            if data.startswith("[EDIT]") or data.startswith("[DELETE]"):
+                await group_manager.broadcast(group_id, f"__SIGNAL__:{data}")
+                continue
             from app.models.group import GroupMessage
             async with AsyncSessionLocal() as db:
                 gm = GroupMessage(group_id=group_id, sender_id=user_id, content=data)

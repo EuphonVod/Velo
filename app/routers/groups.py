@@ -503,3 +503,49 @@ async def ban(
     db.add(b)
     await db.commit()
     return {"status": "banned"}
+
+class GroupEditData(BaseModel):
+    message_id: int
+    new_content: str
+
+class GroupDeleteData(BaseModel):
+    message_id: int
+
+
+@router.post("/{group_id}/edit_message")
+async def edit_group_message(
+    group_id: int,
+    data: GroupEditData,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    my_id = current_user.id
+    res = await db.execute(select(GroupMessage).where(GroupMessage.id == data.message_id))
+    msg = res.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.sender_id != my_id:
+        raise HTTPException(403, "Not your message")
+    msg.content = data.new_content
+    msg.edited = True
+    await db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/{group_id}/delete_message")
+async def delete_group_message(
+    group_id: int,
+    data: GroupDeleteData,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    my_id = current_user.id
+    res = await db.execute(select(GroupMessage).where(GroupMessage.id == data.message_id))
+    msg = res.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.sender_id != my_id:
+        raise HTTPException(403, "Not your message")
+    await db.delete(msg)
+    await db.commit()
+    return {"status": "ok"}

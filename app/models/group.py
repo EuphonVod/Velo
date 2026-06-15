@@ -30,6 +30,7 @@ class GroupMessage(Base):
     sender_id: Mapped[int] = mapped_column(ForeignKey("user.id"))
     content: Mapped[str] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+    edited: Mapped[bool] = mapped_column(default=False, nullable=True)
 
 
 class GroupInvite(Base):

@@ -4,7 +4,7 @@ from sqlalchemy import text
 
 async def migrate():
     async with engine.begin() as conn:
-        await conn.execute(text('ALTER TABLE message ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE'))
+        await conn.execute(text('ALTER TABLE group_message ADD COLUMN IF NOT EXISTS edited BOOLEAN DEFAULT FALSE'))
         print("Migration OK !")
 
 asyncio.run(migrate())

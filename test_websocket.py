@@ -1,10 +1,6 @@
-import websocket
-websocket.enableTrace(True)  # affiche tous les détails
-
-ws = websocket.WebSocket()
 try:
-    ws.connect("wss://velo-n1cd.onrender.com/chat/ws/1")
-    print("✓ CONNECTÉ")
-    ws.close()
+    from PIL import ImageGrab
+    img = ImageGrab.grab()
+    print("✓ Capture écran OK, taille:", img.size)
 except Exception as e:
     print("✗ Erreur:", e)
