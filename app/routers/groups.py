@@ -158,9 +158,11 @@ async def group_members(
         u = ures.scalar_one_or_none()
         if u:
             out.append({
-                "user_id": u.id, "username": u.username,
-                "avatar_url": u.avatar_url or "", "slug": u.slug,
-                "role": m.role,
+                "id": m.id,
+                "sender_id": m.sender_id,
+                "sender_name": u.username if u else "?",
+                "content": m.content,
+                "edited": getattr(m, "edited", False),
             })
     return out
 
