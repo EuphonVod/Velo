@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import requests
 import websocket
 import threading
@@ -7,16 +8,18 @@ import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QLineEdit,
     QPushButton, QVBoxLayout, QHBoxLayout, QScrollArea, QTextEdit,
-    QFileDialog, QFrame, QSizePolicy, QStackedWidget
+    QFileDialog, QFrame, QSizePolicy, QStackedWidget, QMenu,
+    QGridLayout, QComboBox, QInputDialog
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QRect
+from PyQt6.QtCore import (
+    Qt, QTimer, pyqtSignal, QRect, QThread, QObject,
+    QByteArray, QBuffer, QSize
+)
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QPen, QPixmap,
-    QLinearGradient, QPainterPath, QCursor
+    QLinearGradient, QPainterPath, QCursor, QMovie, QImage, QIcon
 )
-from PyQt6.QtCore import QThread, QObject
 from datetime import datetime, timezone
-from PyQt6.QtWidgets import QMenu
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from call_engine import CallEngine
@@ -89,13 +92,44 @@ AVATAR_PALETTE = [
 
 BASE_URL = "https://velo-n1cd.onrender.com"
 WS_URL = "wss://velo-n1cd.onrender.com"
-KLIPY_API_KEY = "kAqIH9ikknz91cFvEwroaGoea1pbXIyJZYJZmZLjtl9BBOadade58qkJKPdVDX9n"
+from dotenv import load_dotenv
+load_dotenv()  # charge le fichier .env (à côté de client.py)
+
+KLIPY_API_KEY = os.getenv("KLIPY_API_KEY", "")
 KLIPY_BASE = "https://api.klipy.com/api/v1"
 H = lambda token: {"Authorization": f"Bearer {token}"}
 LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 
 # Flag global pour relancer le login après déconnexion
 _RELOGIN = False
+
+# ── Stockage sécurisé du token (Windows Credential Manager via keyring) ──
+import keyring
+
+KEYRING_SERVICE = "VeloMessaging"
+KEYRING_KEY = "auth_token"
+
+def save_token(token):
+    """Sauvegarde le token dans le gestionnaire sécurisé de l'OS."""
+    try:
+        keyring.set_password(KEYRING_SERVICE, KEYRING_KEY, token)
+    except Exception as ex:
+        print("token save error:", ex)
+
+def load_saved_token():
+    """Récupère le token sauvegardé, ou None."""
+    try:
+        return keyring.get_password(KEYRING_SERVICE, KEYRING_KEY)
+    except Exception as ex:
+        print("token load error:", ex)
+        return None
+
+def clear_token():
+    """Supprime le token sauvegardé (au logout)."""
+    try:
+        keyring.delete_password(KEYRING_SERVICE, KEYRING_KEY)
+    except Exception:
+        pass  # pas grave si déjà absent
 
 
 # ── Avatar ────────────────────────────────────────────────
@@ -156,46 +190,19 @@ def _squircle_path(size, n=5.0):
 
 
 def make_rounded_logo(path, size, radius_ratio=0.30):
-    """Logo dans un squircle iOS avec fond dégradé bleu pour bien ressortir."""
-    # 1) Construit le masque squircle anti-aliasé
-    mask = QPixmap(size, size); mask.fill(Qt.GlobalColor.transparent)
-    mp = QPainter(mask)
-    mp.setRenderHint(QPainter.RenderHint.Antialiasing)
-    mp.setBrush(QColor("white")); mp.setPen(Qt.PenStyle.NoPen)
-    mp.drawPath(_squircle_path(size))
-    mp.end()
-
-    # 2) Construit le contenu : fond dégradé + logo par-dessus
-    base = QPixmap(size, size); base.fill(Qt.GlobalColor.transparent)
-    bp = QPainter(base)
-    bp.setRenderHint(QPainter.RenderHint.Antialiasing)
-    bp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    # Dégradé bleu type icône iOS
-    g = QLinearGradient(0, 0, size, size)
-    g.setColorAt(0, QColor("#4a90d9"))
-    g.setColorAt(1, QColor("#2b5278"))
-    bp.fillRect(0, 0, size, size, g)
+    """Affiche le logo (déjà un squircle détouré) à la taille voulue."""
+    out = QPixmap(size, size); out.fill(Qt.GlobalColor.transparent)
     if path and os.path.exists(path):
         src = QPixmap(path)
-        # Logo légèrement réduit avec marge pour respirer
-        inner = int(size * 0.78)
-        scaled = src.scaled(inner, inner,
+        scaled = src.scaled(size, size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         ox = (size - scaled.width()) // 2
         oy = (size - scaled.height()) // 2
-        bp.drawPixmap(ox, oy, scaled)
-    bp.end()
-
-    # 3) Composite avec le masque squircle
-    out = QPixmap(size, size); out.fill(Qt.GlobalColor.transparent)
-    op = QPainter(out)
-    op.setRenderHint(QPainter.RenderHint.Antialiasing)
-    op.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-    op.drawPixmap(0, 0, mask)
-    op.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-    op.drawPixmap(0, 0, base)
-    op.end()
+        p.drawPixmap(ox, oy, scaled)
+        p.end()
     return out
 
 
@@ -291,39 +298,93 @@ class Bubble(QWidget):
     edit_requested = pyqtSignal(int, str)   # (message_id, current_text)
     delete_requested = pyqtSignal(int)      # (message_id)
 
-    def __init__(self, text, outgoing, msg_id=None, edited=False, parent=None):
+    def __init__(self, text, outgoing, msg_id=None, edited=False, parent=None,
+                 sender_name=None, sender_avatar=None, time_str=None):
         super().__init__(parent)
         self.msg_id = msg_id
         self.outgoing = outgoing
         self._raw_text = text
-        lo = QHBoxLayout(self); lo.setContentsMargins(16, 2, 16, 2)
+        self._sender_name = sender_name
+        self._edited = edited
+        self._time_str = time_str or ""
+
+        lo = QHBoxLayout(self); lo.setContentsMargins(12, 2, 12, 2); lo.setSpacing(8)
+        lo.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        # Avatar (groupes, messages entrants uniquement)
+        avw = None
+        if sender_name and not outgoing:
+            av = Avatar(sender_name, 34, sender_avatar or "")
+            av.setFixedSize(34, 34)
+            avw = QWidget(); avw.setFixedSize(34, 34)
+            avl = QVBoxLayout(avw); avl.setContentsMargins(0, 0, 0, 0)
+            avl.addWidget(av)
+
+        # Bulle : conteneur vertical compact
+        bubble = QWidget()
+        bubble.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        bg = C["msg_out"] if outgoing else C["msg_in"]
+        br = "14px 14px 4px 14px" if outgoing else "14px 14px 14px 4px"
+        bubble.setStyleSheet(f"background:{bg};border-radius:{br};")
+        bubble.setMaximumWidth(540)
+
+        inner = QVBoxLayout(bubble); inner.setContentsMargins(13, 7, 13, 5); inner.setSpacing(2)
+
+        # Nom de l'expéditeur (groupes entrants)
+        if sender_name and not outgoing:
+            nm = QLabel(sender_name)
+            nm.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+            nm.setStyleSheet(f"color:{avatar_color(sender_name)};background:transparent;")
+            inner.addWidget(nm)
+
+        # Texte du message
         self.lbl = QLabel(); self.lbl.setWordWrap(True)
         self.lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.lbl.setFont(QFont("Segoe UI", 12))
-        self.lbl.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
-        self.lbl.setMaximumWidth(520)
-        bg = C["msg_out"] if outgoing else C["msg_in"]
-        br = "13px 13px 3px 13px" if outgoing else "13px 13px 13px 3px"
-        self.lbl.setStyleSheet(f"QLabel{{background:{bg};color:{C['text']};border-radius:{br};padding:9px 14px;}}")
-        self._set_text(text, edited)
+        self.lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
+        self.lbl.setMaximumWidth(510)
+        self.lbl.setText(text)
+        inner.addWidget(self.lbl)
+
+        # Pied : "(edited)" à gauche + heure à droite, même couleur discrète
+        foot = QHBoxLayout(); foot.setContentsMargins(0, 0, 0, 0); foot.setSpacing(8)
+        meta_color = "#cfe0f0" if outgoing else C["text3"]
+        self.edited_lbl = QLabel("edited" if edited else "")
+        self.edited_lbl.setFont(QFont("Segoe UI", 8))
+        self.edited_lbl.setStyleSheet(f"color:{meta_color};background:transparent;")
+        foot.addWidget(self.edited_lbl)
+        foot.addStretch()
+        if time_str:
+            tm = QLabel(time_str)
+            tm.setFont(QFont("Segoe UI", 8))
+            tm.setStyleSheet(f"color:{meta_color};background:transparent;")
+            foot.addWidget(tm)
+        inner.addLayout(foot)
+
         # Clic droit pour modifier/supprimer (seulement ses propres messages)
         if outgoing and msg_id is not None:
             self.lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.lbl.customContextMenuRequested.connect(self._menu)
-        if outgoing: lo.addStretch(); lo.addWidget(self.lbl)
-        else: lo.addWidget(self.lbl); lo.addStretch()
+
+        # Disposition gauche/droite
+        if outgoing:
+            lo.addStretch()
+            lo.addWidget(bubble)
+        else:
+            if avw: lo.addWidget(avw)
+            lo.addWidget(bubble)
+            lo.addStretch()
 
     def _set_text(self, text, edited):
         self._raw_text = text
+        self.lbl.setText(text)
         if edited:
-            self.lbl.setText(f"{text}  ")
-            # petit suffixe "(modifié)" en plus discret
-            self.lbl.setText(f"{text}   (edited)")
-        else:
-            self.lbl.setText(text)
+            self.edited_lbl.setText("edited")
 
     def mark_edited(self, new_text):
-        self._set_text(new_text, True)
+        self._raw_text = new_text
+        self.lbl.setText(new_text)
+        self.edited_lbl.setText("edited")
 
     def _menu(self, pos):
         menu = QMenu(self)
@@ -341,6 +402,7 @@ class Bubble(QWidget):
 # ── Contact / friend row ──────────────────────────────────
 class FriendRow(QWidget):
     clicked = pyqtSignal(int)
+    hide_requested = pyqtSignal(int)
     def __init__(self, user, parent=None):
         super().__init__(parent)
         self.uid = user["id"]; self.uname = user.get("username", "?")
@@ -386,7 +448,23 @@ class FriendRow(QWidget):
     def set_selected(self, v): self._sel = v; self._upd()
     def _upd(self):
         self.setStyleSheet(f"background:{C['selected'] if self._sel else 'transparent'};border-radius:10px;")
-    def mousePressEvent(self, e): self.clicked.emit(self.uid)
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self._show_menu(e)
+            return
+        self.clicked.emit(self.uid)
+
+    def _show_menu(self, e):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
+                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
+            QMenu::item {{padding:8px 18px;border-radius:6px;}}
+            QMenu::item:selected {{background:{C['hover']};}}
+        """)
+        menu.addAction("🗙  Remove from list", lambda: self.hide_requested.emit(self.uid))
+        menu.exec(self.mapToGlobal(e.pos()))
+
     def enterEvent(self, e):
         if not self._sel: self.setStyleSheet(f"background:{C['hover']};border-radius:10px;")
     def leaveEvent(self, e): self._upd()
@@ -591,161 +669,6 @@ class Toggle(QPushButton):
         p.drawEllipse(x, 3, 20, 20)
         p.end()
 
-# ── Settings dialog ───────────────────────────────────────
-class SettingsDialog(QDialog):
-    profile_updated = pyqtSignal(dict)
-    notif_changed = pyqtSignal(bool)
-    def __init__(self, token, user, parent=None):
-        super().__init__(parent)
-        self.token = token; self.user = user; self.avatar_path = ""
-        self.setWindowTitle("Settings")
-        self.setFixedSize(430, 560)
-        self.setStyleSheet(f"background:{C['bg']};")
-        self._build()
-
-    def _combo_style(self):
-        return f"""
-            QComboBox {{background:{C['panel']};color:{C['text']};border:1.5px solid {C['card']};
-                border-radius:8px;padding:8px 12px;font-size:12px;font-family:'Segoe UI';}}
-            QComboBox:hover {{border-color:{C['accent']};}}
-            QComboBox::drop-down {{border:none;width:24px;}}
-            QComboBox QAbstractItemView {{background:{C['card']};color:{C['text']};
-                selection-background-color:{C['accent']};border:none;outline:none;}}
-        """
-    def _build(self):
-        lo = QVBoxLayout(self); lo.setContentsMargins(34, 30, 34, 30); lo.setSpacing(12)
-        t = QLabel("My profile")
-        t.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
-        t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
-        av_row = QHBoxLayout()
-        self.av_w = Avatar(self.user.get("username", "?"), 80, self.user.get("avatar_url", ""))
-        self.av_w.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.av_w.mousePressEvent = lambda e: self._pick()
-        ch = QLabel("Tap to change"); ch.setFont(QFont("Segoe UI", 10))
-        ch.setStyleSheet(f"color:{C['text2']};")
-        avc = QVBoxLayout(); avc.setSpacing(6)
-        avc.addWidget(self.av_w, alignment=Qt.AlignmentFlag.AlignCenter)
-        avc.addWidget(ch, alignment=Qt.AlignmentFlag.AlignCenter)
-        av_row.addLayout(avc); av_row.addStretch(); lo.addLayout(av_row)
-        ls = f"color:{C['text2']};font-size:11px;font-family:'Segoe UI';"
-        def lbl(x): l = QLabel(x); l.setStyleSheet(ls); return l
-        lo.addWidget(lbl("Username"))
-        self.un = QLineEdit(self.user.get("username", "")); self.un.setFixedHeight(42)
-        self.un.setStyleSheet(field()); lo.addWidget(self.un)
-        lo.addWidget(lbl("Bio"))
-        self.bio = QTextEdit(); self.bio.setFixedHeight(76)
-        self.bio.setPlainText(self.user.get("bio", "")); self.bio.setStyleSheet(field())
-        lo.addWidget(self.bio)
-        self.status = QLabel(""); self.status.setFont(QFont("Segoe UI", 11))
-        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.status)
-        def toggle_row(label_text, desc_text, checked):
-            row = QWidget()
-            rl = QHBoxLayout(row);
-            rl.setContentsMargins(0, 4, 0, 4)
-            col = QVBoxLayout();
-            col.setSpacing(1)
-            lab = QLabel(label_text)
-            lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
-            lab.setStyleSheet(f"color:{C['text']};")
-            desc = QLabel(desc_text)
-            desc.setFont(QFont("Segoe UI", 10))
-            desc.setStyleSheet(f"color:{C['text2']};")
-            col.addWidget(lab);
-            col.addWidget(desc)
-            rl.addLayout(col);
-            rl.addStretch()
-            tog = Toggle(checked)
-            rl.addWidget(tog)
-            return row, tog
-
-        sep2 = QFrame();
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color:{C['divider']};")
-        lo.addWidget(sep2)
-
-        priv_row, self.priv_toggle = toggle_row(
-            "Private profile", "Only friends can see your bio and message you",
-            self.user.get("is_private", False))
-        lo.addWidget(priv_row)
-
-        online_row, self.online_toggle = toggle_row(
-            "Show online status", "Others can see when you're online",
-            self.user.get("show_online", True))
-        lo.addWidget(online_row)
-        notif_row, self.notif_toggle = toggle_row(
-            "Notifications", "Sound and desktop alerts for new messages",
-            getattr(self.parent(), "notifications_on", True) if self.parent() else True)
-        lo.addWidget(notif_row)
-        self.notif_toggle.toggled.connect(self.notif_changed.emit)
-        sep3 = QFrame();
-        sep3.setFrameShape(QFrame.Shape.HLine)
-        sep3.setStyleSheet(f"color:{C['divider']};")
-        lo.addWidget(sep3)
-
-        audio_title = QLabel("Call audio")
-        audio_title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
-        audio_title.setStyleSheet(f"color:{C['text']};margin-top:4px;")
-        lo.addWidget(audio_title)
-
-        from PyQt6.QtWidgets import QComboBox
-        inputs, outputs = list_audio_devices()
-
-        lo.addWidget(QLabel("🎤 Microphone"))
-        self.mic_combo = QComboBox()
-        self.mic_combo.setStyleSheet(self._combo_style())
-        for idx, name in inputs:
-            self.mic_combo.addItem(name, idx)
-        lo.addWidget(self.mic_combo)
-
-        lo.addWidget(QLabel("🔊 Speaker"))
-        self.spk_combo = QComboBox()
-        self.spk_combo.setStyleSheet(self._combo_style())
-        for idx, name in outputs:
-            self.spk_combo.addItem(name, idx)
-        lo.addWidget(self.spk_combo)
-
-        # Pré-sélectionne la config actuelle
-        cfg = self.parent()._load_audio_config() if self.parent() else {"mic": None, "speaker": None}
-        if cfg.get("mic") is not None:
-            i = self.mic_combo.findData(cfg["mic"])
-            if i >= 0: self.mic_combo.setCurrentIndex(i)
-        if cfg.get("speaker") is not None:
-            i = self.spk_combo.findData(cfg["speaker"])
-            if i >= 0: self.spk_combo.setCurrentIndex(i)
-        lo.addStretch()
-        save = btn("Save changes", C["accent"], bold=True, font_size=14)
-        save.setFixedHeight(46); save.clicked.connect(self._save); lo.addWidget(save)
-    def _pick(self):
-        p, _ = QFileDialog.getOpenFileName(self, "Choose image", "", "Images (*.png *.jpg *.jpeg *.webp)")
-        if p: self.avatar_path = p; self.av_w.refresh(self.user.get("username", "?"), p)
-    def _save(self):
-        if hasattr(self, "mic_combo") and self.parent():
-            mic_idx = self.mic_combo.currentData()
-            spk_idx = self.spk_combo.currentData()
-            self.parent()._save_audio_config(mic_idx, spk_idx)
-        payload = {
-            "username": self.un.text().strip(),
-            "bio": self.bio.toPlainText().strip(),
-            "is_private": self.priv_toggle.isChecked(),
-            "show_online": self.online_toggle.isChecked(),
-        }
-        if self.avatar_path: payload["avatar_url"] = self.avatar_path
-        try:
-            r = requests.patch(f"{BASE_URL}/auth/me", json=payload, headers=H(self.token))
-            if r.status_code == 200:
-                updated = r.json()
-                if self.avatar_path: updated["avatar_url"] = self.avatar_path
-                self.profile_updated.emit(updated)
-                self.status.setStyleSheet(f"color:{C['green']};")
-                self.status.setText("✓ Profile updated")
-                QTimer.singleShot(1300, self.accept)
-            else:
-                self.status.setStyleSheet(f"color:{C['red']};")
-                self.status.setText("Update failed.")
-        except Exception:
-            self.status.setStyleSheet(f"color:{C['red']};")
-            self.status.setText("Cannot reach server.")
-
 
 # ── Search dialog ─────────────────────────────────────────
 class SearchDialog(QDialog):
@@ -764,12 +687,20 @@ class SearchDialog(QDialog):
         t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
         self.inp = QLineEdit(); self.inp.setPlaceholderText("Search by @username")
         self.inp.setFixedHeight(42); self.inp.setStyleSheet(field())
-        self.inp.textChanged.connect(self._search); lo.addWidget(self.inp)
+        self.inp.textChanged.connect(self._on_type); lo.addWidget(self.inp)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet("border:none;background:transparent;")
         self.box = QWidget(); self.box.setStyleSheet("background:transparent;")
         self.vbox = QVBoxLayout(self.box); self.vbox.setSpacing(4); self.vbox.addStretch()
         self.scroll.setWidget(self.box); lo.addWidget(self.scroll)
+        # Debounce : attend 350ms après la dernière frappe avant de chercher
+        self._search_timer = QTimer(self); self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._search)
+        self._workers = []
+        self._search_seq = 0   # pour ignorer les réponses obsolètes
+
+    def _on_type(self):
+        self._search_timer.start(350)
 
     def _search(self):
         q = self.inp.text().strip()
@@ -777,15 +708,29 @@ class SearchDialog(QDialog):
             it = self.vbox.takeAt(0)
             if it.widget(): it.widget().deleteLater()
         if len(q) < 1: return
-        # Cherche les utilisateurs
-        users = api_get(f"/friends/search?q={q}", self.token) or []
-        for u in users:
+        self._search_seq += 1
+        seq = self._search_seq
+        # Recherche utilisateurs (async)
+        wu = ApiWorker(api_get, f"/friends/search?q={q}", self.token)
+        wu.done.connect(lambda users, s=seq: self._show_users(users, s))
+        wu.done.connect(lambda *_: self._workers.remove(wu) if wu in self._workers else None)
+        self._workers.append(wu); wu.start()
+        # Recherche groupes publics (async)
+        wg = ApiWorker(api_get, f"/groups/search/public?q={q}", self.token)
+        wg.done.connect(lambda groups, s=seq: self._show_groups(groups, s))
+        wg.done.connect(lambda *_: self._workers.remove(wg) if wg in self._workers else None)
+        self._workers.append(wg); wg.start()
+
+    def _show_users(self, users, seq):
+        if seq != self._search_seq: return  # réponse obsolète, ignore
+        for u in (users or []):
             row = FriendRow(u)
             row.clicked.connect(lambda _, usr=u: self._open(usr))
             self.vbox.insertWidget(self.vbox.count() - 1, row)
-        # Cherche les groupes publics
-        groups = api_get(f"/groups/search/public?q={q}", self.token) or []
-        for g in groups:
+
+    def _show_groups(self, groups, seq):
+        if seq != self._search_seq: return
+        for g in (groups or []):
             row = self._group_result(g)
             self.vbox.insertWidget(self.vbox.count() - 1, row)
 
@@ -833,39 +778,42 @@ class LoginDialog(QDialog):
         self.token = None; self.user = None
         self._build()
     def _build(self):
-        lo = QVBoxLayout(self); lo.setContentsMargins(48, 44, 48, 40); lo.setSpacing(0)
+        lo = QVBoxLayout(self); lo.setContentsMargins(48, 50, 48, 40); lo.setSpacing(0)
+        lo.addStretch()
         icon = QLabel()
         if os.path.exists(LOGO_PATH):
-            icon.setPixmap(make_rounded_logo(LOGO_PATH, 112))
+            icon.setPixmap(make_rounded_logo(LOGO_PATH, 124))
         else:
             icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 52))
             icon.setStyleSheet(f"color:{C['accent']};")
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(icon)
-        lo.addSpacing(14)
-        t = QLabel("Velo"); t.setFont(QFont("Segoe UI", 25, QFont.Weight.Bold))
+        lo.addSpacing(18)
+        t = QLabel("Velo"); t.setFont(QFont("Segoe UI", 27, QFont.Weight.Bold))
         t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
         lo.addWidget(t)
+        lo.addSpacing(4)
         sub = QLabel("Fast and secure messaging"); sub.setFont(QFont("Segoe UI", 12))
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setStyleSheet(f"color:{C['text2']};margin-bottom:28px;"); lo.addWidget(sub)
-        self.email = QLineEdit();
+        sub.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(sub)
+        lo.addSpacing(30)
+        self.email = QLineEdit()
         self.email.setPlaceholderText("Email or username")
-        self.email.setFixedHeight(44); self.email.setStyleSheet(field(12)); lo.addWidget(self.email)
+        self.email.setFixedHeight(46); self.email.setStyleSheet(field(12)); lo.addWidget(self.email)
         lo.addSpacing(10)
         self.pw = QLineEdit(); self.pw.setPlaceholderText("Password")
         self.pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pw.setFixedHeight(44); self.pw.setStyleSheet(field(12))
+        self.pw.setFixedHeight(46); self.pw.setStyleSheet(field(12))
         self.pw.returnPressed.connect(self._login); lo.addWidget(self.pw)
-        lo.addSpacing(10)
+        lo.addSpacing(8)
         self.err = QLabel(""); self.err.setFont(QFont("Segoe UI", 11))
         self.err.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.err.setStyleSheet(f"color:{C['red']};"); lo.addWidget(self.err)
         lo.addSpacing(6)
         lb = btn("Log in", C["accent"], bold=True, font_size=14)
-        lb.setFixedHeight(46); lb.clicked.connect(self._login); lo.addWidget(lb)
+        lb.setFixedHeight(48); lb.clicked.connect(self._login); lo.addWidget(lb)
         lo.addSpacing(10)
-        rb = QPushButton("Create account"); rb.setFixedHeight(44)
+        rb = QPushButton("Create account"); rb.setFixedHeight(46)
         rb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         rb.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['accent']};
             border:1.5px solid {C['accent']};border-radius:10px;font-size:13px;
@@ -880,6 +828,7 @@ class LoginDialog(QDialog):
                               json={"identifier": self.email.text().strip(), "password": self.pw.text()})
             if r.status_code == 200:
                 self.token = r.json()["access_token"]
+                save_token(self.token)  # mémorise pour les prochaines ouvertures
                 self.user = api_get("/auth/me", self.token); self.accept()
             else:
                 self.err.setText("Wrong email or password.")
@@ -978,6 +927,7 @@ class CreateGroupDialog(QDialog):
 
 class GroupRow(QWidget):
     clicked = pyqtSignal(int)
+    hide_requested = pyqtSignal(int)
     def __init__(self, group, parent=None):
         super().__init__(parent)
         self.gid = group["id"]; self.gname = group.get("name", "?")
@@ -1002,7 +952,21 @@ class GroupRow(QWidget):
     def set_selected(self, v): self._sel = v; self._upd()
     def _upd(self):
         self.setStyleSheet(f"background:{C['selected'] if self._sel else 'transparent'};border-radius:10px;")
-    def mousePressEvent(self, e): self.clicked.emit(self.gid)
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.RightButton:
+            self._show_menu(e)
+            return
+        self.clicked.emit(self.gid)
+    def _show_menu(self, e):
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
+                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
+            QMenu::item {{padding:8px 18px;border-radius:6px;}}
+            QMenu::item:selected {{background:{C['hover']};}}
+        """)
+        menu.addAction("🗙  Remove from list", lambda: self.hide_requested.emit(self.gid))
+        menu.exec(self.mapToGlobal(e.pos()))
     def enterEvent(self, e):
         if not self._sel: self.setStyleSheet(f"background:{C['hover']};border-radius:10px;")
     def leaveEvent(self, e): self._upd()
@@ -1505,7 +1469,6 @@ class EmojiPicker(QDialog):
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border:none;background:transparent;")
         grid_w = QWidget(); grid_w.setStyleSheet("background:transparent;")
-        from PyQt6.QtWidgets import QGridLayout
         grid = QGridLayout(grid_w); grid.setSpacing(2)
         cols = 8
         for i, emo in enumerate(self.EMOJIS):
@@ -1553,7 +1516,6 @@ class GifPicker(QDialog):
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet("border:none;background:transparent;")
         self.grid_w = QWidget(); self.grid_w.setStyleSheet("background:transparent;")
-        from PyQt6.QtWidgets import QGridLayout
         self.grid = QGridLayout(self.grid_w); self.grid.setSpacing(6)
         self.scroll.setWidget(self.grid_w); lo.addWidget(self.scroll)
         # Timer de debounce pour la recherche
@@ -1608,7 +1570,6 @@ class GifPicker(QDialog):
             self.grid.addWidget(cell, i // cols, i % cols)
     def _load_favs(self):
         try:
-            import json, os
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gif_favorites.json")
             if os.path.exists(path):
                 with open(path) as f: return json.load(f)
@@ -1646,8 +1607,6 @@ class AnimatedGif(QLabel):
         if not data:
             self.setText("⚠")
             return
-        from PyQt6.QtCore import QByteArray, QBuffer, QSize
-        from PyQt6.QtGui import QMovie
         self._bytes = QByteArray(data)
         self._buffer = QBuffer(self._bytes)
         self._buffer.open(QBuffer.OpenModeFlag.ReadOnly)
@@ -1768,7 +1727,6 @@ class CallDialog(QDialog):
         self.screen_btn.setVisible(True)
     def _show_remote_frame(self, img):
         # img = ndarray RGB
-        from PyQt6.QtGui import QImage
         h, w, ch = img.shape
         bytes_per_line = ch * w
         qimg = QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
@@ -1789,6 +1747,7 @@ class SettingsPage(QWidget):
 
     def __init__(self, token, user, parent=None):
         super().__init__(parent)
+        self.app = parent   # référence explicite vers VeloApp (parent() devient le QStackedWidget)
         self.token = token
         self.user = user
         self.avatar_path = ""
@@ -1902,7 +1861,7 @@ class SettingsPage(QWidget):
         lo.addWidget(online_row)
         notif_row, self.notif_toggle = toggle_row(
             "Notifications", "Sound and desktop alerts for new messages",
-            getattr(self.parent(), "notifications_on", True) if self.parent() else True)
+            getattr(self.app, "notifications_on", True) if self.app else True)
         lo.addWidget(notif_row)
         self.notif_toggle.toggled.connect(self.notif_changed.emit)
 
@@ -1911,7 +1870,6 @@ class SettingsPage(QWidget):
         lo.addSpacing(4); lo.addWidget(sep2); lo.addSpacing(4)
         lo.addWidget(section_label("CALL AUDIO"))
 
-        from PyQt6.QtWidgets import QComboBox
         inputs, outputs = list_audio_devices()
         lo.addWidget(small_label("🎤 Microphone"))
         self.mic_combo = QComboBox(); self.mic_combo.setStyleSheet(self._combo_style())
@@ -1923,7 +1881,7 @@ class SettingsPage(QWidget):
         for idx, name in outputs:
             self.spk_combo.addItem(name, idx)
         lo.addWidget(self.spk_combo)
-        cfg = self.parent()._load_audio_config() if self.parent() else {"mic": None, "speaker": None}
+        cfg = self.app._load_audio_config() if self.app else {"mic": None, "speaker": None}
         if cfg.get("mic") is not None:
             i = self.mic_combo.findData(cfg["mic"])
             if i >= 0: self.mic_combo.setCurrentIndex(i)
@@ -1959,8 +1917,8 @@ class SettingsPage(QWidget):
             self.av_w.refresh(self.user.get("username", "?"), p)
 
     def _save(self):
-        if hasattr(self, "mic_combo") and self.parent():
-            self.parent()._save_audio_config(self.mic_combo.currentData(), self.spk_combo.currentData())
+        if hasattr(self, "mic_combo") and self.app:
+            self.app._save_audio_config(self.mic_combo.currentData(), self.spk_combo.currentData())
         payload = {
             "username": self.un.text().strip(),
             "bio": self.bio.toPlainText().strip(),
@@ -2041,7 +1999,7 @@ class VeloApp(QMainWindow):
         self.group_ws = None
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._periodic_refresh)
-        self.refresh_timer.start(5000)
+        self.refresh_timer.start(10000)
         self._typing_timer = QTimer(self)
         self._typing_timer.setSingleShot(True)
         self._typing_timer.timeout.connect(self._stop_typing)
@@ -2049,7 +2007,6 @@ class VeloApp(QMainWindow):
         self.typing_bubble = None
 
     def _toggle_camera(self):
-        print("[CAM] _toggle_camera appelé")
         if getattr(self, "_video_mode", None) == "camera":
             # Couper la caméra
             self.call_engine.stop_video()
@@ -2077,7 +2034,6 @@ class VeloApp(QMainWindow):
             self.active_call_dialog.cam_btn.setStyleSheet(self.active_call_dialog._tool_style())
 
     def _load_audio_config(self):
-        import json, os
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_config.json")
         try:
             if os.path.exists(path):
@@ -2088,7 +2044,6 @@ class VeloApp(QMainWindow):
         return {"mic": None, "speaker": None}
 
     def _save_audio_config(self, mic_idx, speaker_idx):
-        import json, os
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_config.json")
         try:
             with open(path, "w") as f:
@@ -2406,9 +2361,9 @@ class VeloApp(QMainWindow):
 
     def _on_group_incoming(self, message):
         if ":" not in message: return
-        sender_name, content = message.split(":", 1)
-        # Signaux edit/delete de groupe
-        if sender_name == "__SIGNAL__":
+        header, content = message.split(":", 1)
+        # Signaux edit/delete de groupe (header == "__SIGNAL__")
+        if header == "__SIGNAL__":
             if content.startswith("[EDIT]"):
                 payload = content[len("[EDIT]"):]
                 parts = payload.split("|", 1)
@@ -2425,24 +2380,61 @@ class VeloApp(QMainWindow):
                 except ValueError:
                     pass
             return
+        # Format normal : "sender_name|msg_id"
+        msg_id = None
+        sender_name = header
+        if "|" in header:
+            sender_name, id_str = header.rsplit("|", 1)
+            try:
+                msg_id = int(id_str)
+            except ValueError:
+                msg_id = None
+        # Mon propre message renvoyé → on attribue juste l'id à la bulle en attente
         if sender_name == self.user["username"]:
+            if msg_id is not None:
+                self._assign_group_sent_id(msg_id, self.current_group_id)
             return
+        # Message d'un autre membre
         if content.startswith("[FILE]"):
             w = self._parse_attachment(content, False)
             if w: self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, w)
         else:
-            self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, Bubble(f"{sender_name}: {content}", False))
+            b = self._make_group_bubble(content, False,
+                                        self.current_group_id, msg_id=msg_id,
+                                        raw_content=content, sender_name=sender_name)
+            self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, b)
         self._scroll_bottom()
+
+    def _assign_group_sent_id(self, new_id, gid):
+        b = getattr(self, "_pending_group_bubble", None)
+        if b is None:
+            return
+        b.msg_id = new_id
+        b._raw_content = getattr(b, "_raw_content", b._raw_text)
+        self._bubbles[new_id] = b
+        b.lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        try:
+            b.lbl.customContextMenuRequested.disconnect()
+        except Exception:
+            pass
+        b.lbl.customContextMenuRequested.connect(b._menu)
+        b.edit_requested.connect(lambda mid, _t, g=gid: self._on_group_edit_requested(mid, g))
+        b.delete_requested.connect(lambda mid, g=gid: self._on_group_delete_requested(mid, g))
+        self._pending_group_bubble = None
 
     def _select_group(self, gid):
         if self.recv_id:
             self._clear_ephemeral(self.recv_id)
+        # Si le groupe était masqué, on le ré-affiche
+        if gid in self._load_hidden_groups():
+            self._unhide_group(gid)
         # Désélectionne amis et groupes
         for w in self.friends.values(): w.set_selected(False)
         for w in self.groups.values(): w.set_selected(False)
         if gid in self.groups: self.groups[gid].set_selected(True)
         self.current_group_id = gid
         self.recv_id = None  # on est en mode groupe
+        self.view_prof.setText("Group settings")
         self.view_prof.setVisible(True)
         self.conv_settings_btn.setVisible(False)
         self.call_btn.setVisible(False)
@@ -2473,15 +2465,19 @@ class VeloApp(QMainWindow):
                 w = self._parse_attachment(content, outgoing)
                 if w: self.msg_vbox.insertWidget(i, w)
             else:
-                text = content if outgoing else f"{m['sender_name']}: {content}"
-                b = self._make_group_bubble(text, outgoing, gid,
+                sender = None if outgoing else m.get("sender_name", "?")
+                b = self._make_group_bubble(content, outgoing, gid,
                                             msg_id=m.get("id"), edited=m.get("edited", False),
-                                            raw_content=content)
+                                            raw_content=content, sender_name=sender)
                 self.msg_vbox.insertWidget(i, b)
         self._scroll_bottom()
 
-    def _make_group_bubble(self, text, outgoing, gid, msg_id=None, edited=False, raw_content=""):
-        b = Bubble(text, outgoing, msg_id=msg_id, edited=edited)
+    def _make_group_bubble(self, text, outgoing, gid, msg_id=None, edited=False,
+                           raw_content="", sender_name=None):
+        import datetime
+        now = datetime.datetime.now().strftime("%H:%M")
+        b = Bubble(text, outgoing, msg_id=msg_id, edited=edited,
+                   sender_name=sender_name, time_str=now)
         b._raw_content = raw_content  # contenu sans le préfixe "nom:"
         if msg_id is not None:
             self._bubbles[msg_id] = b
@@ -2491,7 +2487,6 @@ class VeloApp(QMainWindow):
         return b
 
     def _on_group_edit_requested(self, msg_id, gid):
-        from PyQt6.QtWidgets import QInputDialog
         current = ""
         if msg_id in self._bubbles:
             current = getattr(self._bubbles[msg_id], "_raw_content", "")
@@ -2527,12 +2522,16 @@ class VeloApp(QMainWindow):
         for gid, row in list(self.groups.items()):
             row.deleteLater()
         self.groups.clear()
+        hidden = self._load_hidden_groups()
         pos = self.fvbox.count() - 1
         for g in groups:
             row = GroupRow(g)
             row.clicked.connect(self._select_group)
+            row.hide_requested.connect(self._hide_group)
             self.groups[g["id"]] = row
-            self.fvbox.insertWidget(pos, row);
+            self.fvbox.insertWidget(pos, row)
+            if g["id"] in hidden:
+                row.setVisible(False)
             pos += 1
 
     def _create_group(self):
@@ -2563,6 +2562,9 @@ class VeloApp(QMainWindow):
         worker.start()
 
     def _periodic_refresh(self):
+        # Évite de surcharger : ne rafraîchit pas si la fenêtre est en arrière-plan
+        if not self.isActiveWindow():
+            return
         self._async(api_get, self._apply_friends_refresh, "/friends/list", self.token)
         self._async(api_get, self._apply_badge, "/friends/requests", self.token)
         self._async(api_get, self._fill_groups, "/groups/my", self.token)
@@ -2642,6 +2644,18 @@ class VeloApp(QMainWindow):
         new_group_btn.clicked.connect(self._create_group)
         chl2.addWidget(new_group_btn)
         sb.addWidget(chats_hdr)
+
+        # Barre de recherche locale (filtre amis + retrouve les masqués)
+        search_wrap = QWidget()
+        swl = QHBoxLayout(search_wrap); swl.setContentsMargins(10, 2, 10, 6); swl.setSpacing(0)
+        self.sidebar_search = QLineEdit()
+        self.sidebar_search.setPlaceholderText("🔍  Search conversations")
+        self.sidebar_search.setFixedHeight(36)
+        self.sidebar_search.setStyleSheet(f"""QLineEdit{{background:{C['card']};color:{C['text']};
+            border:none;border-radius:9px;padding:0 12px;font-size:12px;font-family:'Segoe UI';}}""")
+        self.sidebar_search.textChanged.connect(self._filter_sidebar)
+        swl.addWidget(self.sidebar_search)
+        sb.addWidget(search_wrap)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border:none;background:transparent;")
@@ -2741,17 +2755,111 @@ class VeloApp(QMainWindow):
     def _load_friends(self):
         self._async(api_get, lambda f: self._load_friends_from_data(f) if f else None, "/friends/list", self.token)
 
+    def _filter_sidebar(self, text):
+        q = text.strip().lower()
+        hidden = self._load_hidden()
+        for uid, row in self.friends.items():
+            if not q:
+                # Champ vide : on respecte le masquage
+                row.setVisible(uid not in hidden)
+            else:
+                # Recherche : montre tout ce qui correspond (même masqué)
+                name = row.uname.lower()
+                match = q in name
+                row.setVisible(match)
+        # Filtre aussi les groupes par leur nom
+        for gid, row in self.groups.items():
+            if not q:
+                row.setVisible(True)
+            else:
+                gname = getattr(row, "gname", "").lower()
+                row.setVisible(q in gname)
+
+    def _hidden_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hidden_convs.json")
+
+    def _load_hidden(self):
+        try:
+            p = self._hidden_path()
+            if os.path.exists(p):
+                with open(p) as f:
+                    return set(json.load(f))
+        except Exception:
+            pass
+        return set()
+
+    def _save_hidden(self, hidden_set):
+        try:
+            with open(self._hidden_path(), "w") as f:
+                json.dump(list(hidden_set), f)
+        except Exception as ex:
+            print("hidden save error:", ex)
+
+    def _hide_conversation(self, uid):
+        hidden = self._load_hidden()
+        hidden.add(uid)
+        self._save_hidden(hidden)
+        # Retire la ligne de la liste
+        if uid in self.friends:
+            self.friends[uid].setVisible(False)
+
+    def _unhide_conversation(self, uid):
+        hidden = self._load_hidden()
+        hidden.discard(uid)
+        self._save_hidden(hidden)
+        if uid in self.friends:
+            self.friends[uid].setVisible(True)
+
+    # ── Masquage des groupes ──────────────────────────────
+    def _hidden_groups_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hidden_groups.json")
+
+    def _load_hidden_groups(self):
+        try:
+            p = self._hidden_groups_path()
+            if os.path.exists(p):
+                with open(p) as f:
+                    return set(json.load(f))
+        except Exception:
+            pass
+        return set()
+
+    def _save_hidden_groups(self, hidden_set):
+        try:
+            with open(self._hidden_groups_path(), "w") as f:
+                json.dump(list(hidden_set), f)
+        except Exception as ex:
+            print("hidden groups save error:", ex)
+
+    def _hide_group(self, gid):
+        hidden = self._load_hidden_groups()
+        hidden.add(gid)
+        self._save_hidden_groups(hidden)
+        if gid in self.groups:
+            self.groups[gid].setVisible(False)
+
+    def _unhide_group(self, gid):
+        hidden = self._load_hidden_groups()
+        hidden.discard(gid)
+        self._save_hidden_groups(hidden)
+        if gid in self.groups:
+            self.groups[gid].setVisible(True)
+
     def _load_friends_from_data(self, friends):
         # Supprime uniquement les FriendRow existantes
         for uid, row in list(self.friends.items()):
             row.deleteLater()
         self.friends.clear()
+        hidden = self._load_hidden()
         pos = self.fvbox.count() - 1
         for u in friends:
-            row = FriendRow(u);
+            row = FriendRow(u)
             row.clicked.connect(self._select)
+            row.hide_requested.connect(self._hide_conversation)
             self.friends[u["id"]] = row
-            self.fvbox.insertWidget(pos, row);
+            self.fvbox.insertWidget(pos, row)
+            if u["id"] in hidden:
+                row.setVisible(False)
             pos += 1
 
     def _refresh_badge(self):
@@ -2782,9 +2890,14 @@ class VeloApp(QMainWindow):
         for w in self.friends.values(): w.set_selected(False)
         if uid in self.friends: self.friends[uid].set_selected(True)
         self.recv_id = uid
+        # Si la conv était masquée, on la ré-affiche (on l'ouvre donc on la veut visible)
+        hidden = self._load_hidden()
+        if uid in hidden:
+            self._unhide_conversation(uid)
         self._async(api_post, lambda r: None, "/chat/mark_read", self.token, {"other_user_id": uid})
         if uid in self.friends:
             self.friends[uid].clear_unread()
+        self.view_prof.setText("View profile")
         self.view_prof.setVisible(True)
         self.conv_settings_btn.setVisible(True)
         self.call_btn.setVisible(True)
@@ -2812,7 +2925,9 @@ class VeloApp(QMainWindow):
             self._set_can_send(True)
 
     def _make_bubble(self, content, outgoing, msg_id=None, edited=False):
-        b = Bubble(content, outgoing, msg_id=msg_id, edited=edited)
+        import datetime
+        now = datetime.datetime.now().strftime("%H:%M")
+        b = Bubble(content, outgoing, msg_id=msg_id, edited=edited, time_str=now)
         if msg_id is not None:
             self._bubbles[msg_id] = b
             if outgoing:
@@ -2838,7 +2953,6 @@ class VeloApp(QMainWindow):
         self._pending_sent_bubble = None
 
     def _on_edit_requested(self, msg_id, current_text):
-        from PyQt6.QtWidgets import QInputDialog
         new_text, ok = QInputDialog.getText(self, "Edit message", "New text:", text=current_text)
         if ok and new_text.strip() and new_text != current_text:
             self._async(api_post, lambda r: None, "/chat/edit_message", self.token,
@@ -2881,13 +2995,6 @@ class VeloApp(QMainWindow):
                     content, outgoing, msg_id=m.get("id"), edited=m.get("edited", False)))
         self._scroll_bottom()
 
-    def _load_history(self, uid):
-        msgs = api_get(f"/chat/history/{self.user['id']}", self.token) or []
-        msgs = [m for m in msgs if {m["sender_id"], m["receiver_id"]} == {self.user["id"], uid}]
-        for i, m in enumerate(msgs):
-            self.msg_vbox.insertWidget(i, Bubble(m["content"], m["sender_id"] == self.user["id"]))
-        self._scroll_bottom()
-
     #websocket
     def _connect_ws(self):
         def on_error(ws, error):
@@ -2908,6 +3015,7 @@ class VeloApp(QMainWindow):
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
     def _on_incoming(self, raw, _):
+        # Accusé de lecture
         if raw.startswith("[READ]"):
             reader_id = int(raw.replace("[READ]", ""))
             if reader_id == self.recv_id and self.last_status_label:
@@ -2985,6 +3093,9 @@ class VeloApp(QMainWindow):
         else:
             # Message d'un autre chat → badge non-lu + notif
             if sender_id in self.friends:
+                # Si la conv était masquée, on la ré-affiche
+                if not self.friends[sender_id].isVisible():
+                    self._unhide_conversation(sender_id)
                 self.friends[sender_id].add_unread()
                 self.friends[sender_id].set_preview(message)
             self._notify(sender_id, message)
@@ -3022,8 +3133,11 @@ class VeloApp(QMainWindow):
         if self.current_group_id and self.group_ws:
             try:
                 self.group_ws.send(text)
-                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, Bubble(text, True))
-                self.inp.clear();
+                bubble = self._make_group_bubble(text, True, self.current_group_id,
+                                                 msg_id=None, raw_content=text)
+                self._pending_group_bubble = bubble  # pour recevoir son id
+                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, bubble)
+                self.inp.clear()
                 self._scroll_bottom()
             except Exception as ex:
                 print("group send error:", ex)
@@ -3063,6 +3177,8 @@ class VeloApp(QMainWindow):
         self.stack.setCurrentIndex(0)
 
     def _logout(self):
+        # Oublie le token sauvegardé (plus d'auto-login)
+        clear_token()
         # Ferme proprement et relance l'écran de login
         try:
             if self.ws: self.ws.close()
@@ -3099,17 +3215,20 @@ class VeloApp(QMainWindow):
     def _view_profile(self):
         # Si on est dans un groupe
         if self.current_group_id:
-            g = api_get(f"/groups/{self.current_group_id}", self.token)
-            if g:
-                d = GroupProfileDialog(self.token, self.user, g, self)
-                d.changed.connect(self._load_groups)
-                d.left.connect(self._on_left_group)
-                d.exec()
+            gid = self.current_group_id
+            self._async(api_get, lambda g: self._open_group_profile(g) if g else None,
+                        f"/groups/{gid}", self.token)
             return
         # Sinon profil d'ami
         if self.recv_id is None: return
-        u = api_get(f"/auth/users/{self.recv_id}", self.token)
-        if u: self._show_profile(u)
+        self._async(api_get, lambda u: self._show_profile(u) if u else None,
+                    f"/auth/users/{self.recv_id}", self.token)
+
+    def _open_group_profile(self, g):
+        d = GroupProfileDialog(self.token, self.user, g, self)
+        d.changed.connect(self._load_groups)
+        d.left.connect(self._on_left_group)
+        d.exec()
 
     def _on_left_group(self):
         self.current_group_id = None
@@ -3133,7 +3252,6 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     app.setApplicationName("Velo")
     if os.path.exists(LOGO_PATH):
-        from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(make_rounded_logo(LOGO_PATH, 64)))
     # Global scrollbar styling (sleeker, modern)
     app.setStyleSheet(f"""
@@ -3146,12 +3264,28 @@ if __name__ == "__main__":
             border-radius:6px; padding:4px 8px; font-family:'Segoe UI'; }}
     """)
     # Boucle login → app → (logout) → login
+    # Au tout premier passage, on tente une connexion auto avec le token sauvegardé.
+    _try_auto = True
     while True:
         _RELOGIN = False
-        login = LoginDialog()
-        if login.exec() != QDialog.DialogCode.Accepted:
-            break
-        win = VeloApp(login.token, login.user)
+        token = None
+        user = None
+        if _try_auto:
+            _try_auto = False
+            saved = load_saved_token()
+            if saved:
+                me = api_get("/auth/me", saved)
+                if me:  # token encore valide
+                    token = saved
+                    user = me
+        # Si pas d'auto-login réussi, on affiche l'écran de connexion
+        if token is None:
+            login = LoginDialog()
+            if login.exec() != QDialog.DialogCode.Accepted:
+                break
+            token = login.token
+            user = login.user
+        win = VeloApp(token, user)
         win.show()
         app.exec()
         if not _RELOGIN:

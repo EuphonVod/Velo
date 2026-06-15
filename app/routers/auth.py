@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.schemas.user import UserCreate, UserResponse, UserLogin, Token, UserUpdate
+from app.schemas.user import UserCreate, UserResponse, UserLogin, Token, UserUpdate, PasswordChange, EmailChange, AccountDelete
 import bcrypt
 from app.database import AsyncSessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -8,6 +8,7 @@ from sqlalchemy import select, or_
 from app.dependencies import get_current_user
 import jwt
 import os
+
 
 
 router = APIRouter()
@@ -123,3 +124,56 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
+@router.post("/change_password")
+async def change_password(
+    data: PasswordChange,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user_db = result.scalar_one_or_none()
+    # Vérifie l'ancien mot de passe
+    if not bcrypt.checkpw(data.current_password.encode("utf-8"),
+                          user_db.hashed_password.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Wrong current password")
+    # Définit le nouveau
+    salt = bcrypt.gensalt()
+    user_db.hashed_password = bcrypt.hashpw(data.new_password.encode("utf-8"), salt).decode("utf-8")
+    await db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/change_email")
+async def change_email(
+    data: EmailChange,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user_db = result.scalar_one_or_none()
+    if not bcrypt.checkpw(data.password.encode("utf-8"),
+                          user_db.hashed_password.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Wrong password")
+    # Vérifie que l'email n'est pas déjà pris
+    existing = await db.execute(select(User).where(User.email == data.new_email))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=400, detail="Email already in use")
+    user_db.email = data.new_email
+    await db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/delete_account")
+async def delete_account(
+    data: AccountDelete,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(select(User).where(User.id == current_user.id))
+    user_db = result.scalar_one_or_none()
+    if not bcrypt.checkpw(data.password.encode("utf-8"),
+                          user_db.hashed_password.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Wrong password")
+    await db.delete(user_db)
+    await db.commit()
+    return {"status": "ok"}
