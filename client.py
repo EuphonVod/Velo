@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QLineEdit,
     QPushButton, QVBoxLayout, QHBoxLayout, QScrollArea, QTextEdit,
     QFileDialog, QFrame, QSizePolicy, QStackedWidget, QMenu,
-    QGridLayout, QComboBox, QInputDialog
+    QGridLayout, QComboBox, QInputDialog, QMessageBox
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QRect, QThread, QObject,
@@ -1738,22 +1738,25 @@ class CallDialog(QDialog):
             self.video_label.setVisible(True)
             self.info_block.setVisible(False)
 
-# ── Full-page Settings ────────────────────────────────────
+# ── Full-page Settings (Discord-style with categories) ────
 class SettingsPage(QWidget):
     profile_updated = pyqtSignal(dict)
     notif_changed = pyqtSignal(bool)
     closed = pyqtSignal()
     logout_requested = pyqtSignal()
+    account_deleted = pyqtSignal()
 
     def __init__(self, token, user, parent=None):
         super().__init__(parent)
-        self.app = parent   # référence explicite vers VeloApp (parent() devient le QStackedWidget)
+        self.app = parent
         self.token = token
         self.user = user
         self.avatar_path = ""
         self.setStyleSheet(f"background:{C['bg']};")
+        self._cat_buttons = {}
         self._build()
 
+    # ── Styles helpers ────────────────────────────────────
     def _combo_style(self):
         return f"""
             QComboBox {{background:{C['panel']};color:{C['text']};border:1.5px solid {C['card']};
@@ -1764,15 +1767,42 @@ class SettingsPage(QWidget):
                 selection-background-color:{C['accent']};border:none;outline:none;}}
         """
 
+    def _section_label(self, text):
+        l = QLabel(text)
+        l.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        l.setStyleSheet(f"color:{C['text3']};letter-spacing:1px;margin-top:6px;")
+        return l
+
+    def _small_label(self, text):
+        l = QLabel(text)
+        l.setStyleSheet(f"color:{C['text2']};font-size:11px;font-family:'Segoe UI';")
+        return l
+
+    def _toggle_row(self, label_text, desc_text, checked):
+        row = QWidget()
+        rl = QHBoxLayout(row); rl.setContentsMargins(0, 6, 0, 6)
+        cc = QVBoxLayout(); cc.setSpacing(2)
+        lab = QLabel(label_text)
+        lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+        lab.setStyleSheet(f"color:{C['text']};")
+        desc = QLabel(desc_text)
+        desc.setFont(QFont("Segoe UI", 10))
+        desc.setStyleSheet(f"color:{C['text2']};")
+        cc.addWidget(lab); cc.addWidget(desc)
+        rl.addLayout(cc); rl.addStretch()
+        tog = Toggle(checked)
+        rl.addWidget(tog, alignment=Qt.AlignmentFlag.AlignVCenter)
+        return row, tog
+
+    # ── Build ─────────────────────────────────────────────
     def _build(self):
         outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
 
-        # ── Top bar with back button ──────────────────────
+        # Top bar
         topbar = QWidget(); topbar.setFixedHeight(58)
         topbar.setStyleSheet(f"background:{C['sidebar']};border-bottom:1px solid {C['divider']};")
         tl = QHBoxLayout(topbar); tl.setContentsMargins(12, 0, 16, 0); tl.setSpacing(10)
-        back = QPushButton("←")
-        back.setFixedSize(36, 36)
+        back = QPushButton("←"); back.setFixedSize(36, 36)
         back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         back.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
         back.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['text']};
@@ -1785,33 +1815,96 @@ class SettingsPage(QWidget):
         tl.addWidget(back); tl.addWidget(title); tl.addStretch()
         outer.addWidget(topbar)
 
-        # ── Scrollable content ────────────────────────────
+        # Body: category sidebar + content stack
+        body = QHBoxLayout(); body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
+        outer.addLayout(body)
+
+        # Category sidebar
+        cat_side = QWidget(); cat_side.setFixedWidth(210)
+        cat_side.setStyleSheet(f"background:{C['sidebar']};")
+        cs = QVBoxLayout(cat_side); cs.setContentsMargins(12, 16, 12, 16); cs.setSpacing(3)
+        body.addWidget(cat_side)
+
+        # Content stack
+        self.stack = QStackedWidget()
+        self.stack.setStyleSheet("background:transparent;")
+        body.addWidget(self.stack, 1)
+
+        # Build category pages
+        categories = [
+            ("Account", "👤", self._page_account),
+            ("Privacy", "🔒", self._page_privacy),
+            ("Notifications", "🔔", self._page_notifications),
+            ("Voice & Video", "🎙", self._page_voice),
+            ("Appearance", "🎨", self._page_appearance),
+            ("About", "ℹ", self._page_about),
+        ]
+        for i, (name, icon, builder) in enumerate(categories):
+            page = builder()
+            wrapped = self._wrap_scroll(page)
+            self.stack.addWidget(wrapped)
+            b = QPushButton(f"  {icon}   {name}")
+            b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            b.setFixedHeight(40)
+            b.setCheckable(True)
+            b.setStyleSheet(self._cat_style())
+            b.clicked.connect(lambda _, idx=i: self._select_cat(idx))
+            cs.addWidget(b)
+            self._cat_buttons[i] = b
+
+        cs.addStretch()
+        # Logout at the bottom of the sidebar
+        logout = QPushButton("  ⏻   Log out")
+        logout.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        logout.setFixedHeight(40)
+        logout.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['red']};
+            border:none;border-radius:8px;text-align:left;padding-left:6px;
+            font-size:13px;font-weight:bold;font-family:'Segoe UI';}}
+            QPushButton:hover{{background:{C['hover']};}}""")
+        logout.clicked.connect(self.logout_requested.emit)
+        cs.addWidget(logout)
+
+        self._select_cat(0)
+
+    def _cat_style(self):
+        return f"""QPushButton{{background:transparent;color:{C['text2']};
+            border:none;border-radius:8px;text-align:left;padding-left:6px;
+            font-size:13px;font-weight:600;font-family:'Segoe UI';}}
+            QPushButton:hover{{background:{C['hover']};color:{C['text']};}}
+            QPushButton:checked{{background:{C['card']};color:{C['text']};}}"""
+
+    def _select_cat(self, idx):
+        for i, b in self._cat_buttons.items():
+            b.setChecked(i == idx)
+        self.stack.setCurrentIndex(idx)
+
+    def _wrap_scroll(self, inner_widget):
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border:none;background:transparent;")
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        content = QWidget(); content.setStyleSheet("background:transparent;")
-        # Center the content column, max width ~560
-        wrap = QHBoxLayout(content); wrap.setContentsMargins(0, 0, 0, 0)
+        host = QWidget(); host.setStyleSheet("background:transparent;")
+        wrap = QHBoxLayout(host); wrap.setContentsMargins(0, 0, 0, 0)
         wrap.addStretch()
-        col_host = QWidget(); col_host.setFixedWidth(560)
-        col_host.setStyleSheet("background:transparent;")
-        lo = QVBoxLayout(col_host); lo.setContentsMargins(40, 28, 40, 28); lo.setSpacing(14)
-        wrap.addWidget(col_host); wrap.addStretch()
-        scroll.setWidget(content)
-        outer.addWidget(scroll)
+        col = QWidget(); col.setFixedWidth(540); col.setStyleSheet("background:transparent;")
+        cl = QVBoxLayout(col); cl.setContentsMargins(40, 28, 40, 28); cl.setSpacing(14)
+        cl.addWidget(inner_widget)
+        cl.addStretch()
+        wrap.addWidget(col); wrap.addStretch()
+        scroll.setWidget(host)
+        return scroll
 
-        def section_label(text):
-            l = QLabel(text)
-            l.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-            l.setStyleSheet(f"color:{C['text3']};letter-spacing:1px;margin-top:6px;")
-            return l
+    def _page_title(self, text):
+        t = QLabel(text)
+        t.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        t.setStyleSheet(f"color:{C['text']};")
+        return t
 
-        def small_label(text):
-            l = QLabel(text)
-            l.setStyleSheet(f"color:{C['text2']};font-size:11px;font-family:'Segoe UI';")
-            return l
+    # ── Page: Account ─────────────────────────────────────
+    def _page_account(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
+        lo.addWidget(self._page_title("My Account"))
 
-        # ── Avatar ────────────────────────────────────────
+        # Avatar
         self.av_w = Avatar(self.user.get("username", "?"), 92, self.user.get("avatar_url", ""))
         self.av_w.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.av_w.mousePressEvent = lambda e: self._pick()
@@ -1820,63 +1913,107 @@ class SettingsPage(QWidget):
         lo.addWidget(self.av_w, alignment=Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(ch, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # ── Profile fields ────────────────────────────────
-        lo.addWidget(section_label("PROFILE"))
-        lo.addWidget(small_label("Username"))
+        lo.addWidget(self._small_label("Username"))
         self.un = QLineEdit(self.user.get("username", "")); self.un.setFixedHeight(44)
         self.un.setStyleSheet(field()); lo.addWidget(self.un)
-        lo.addWidget(small_label("Bio"))
+        lo.addWidget(self._small_label("Bio"))
         self.bio = QTextEdit(); self.bio.setFixedHeight(80)
         self.bio.setPlainText(self.user.get("bio", "")); self.bio.setStyleSheet(field())
         lo.addWidget(self.bio)
 
-        # ── Privacy toggles ───────────────────────────────
-        sep1 = QFrame(); sep1.setFixedHeight(1); sep1.setStyleSheet(f"background:{C['divider']};border:none;")
-        lo.addSpacing(4); lo.addWidget(sep1); lo.addSpacing(4)
-        lo.addWidget(section_label("PRIVACY"))
+        self.acc_status = QLabel(""); self.acc_status.setFont(QFont("Segoe UI", 11))
+        self.acc_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(self.acc_status)
+        save = btn("Save profile", C["accent"], bold=True, font_size=13)
+        save.setFixedHeight(46); save.clicked.connect(self._save_profile); lo.addWidget(save)
 
-        def toggle_row(label_text, desc_text, checked):
-            row = QWidget()
-            rl = QHBoxLayout(row); rl.setContentsMargins(0, 6, 0, 6)
-            cc = QVBoxLayout(); cc.setSpacing(2)
-            lab = QLabel(label_text)
-            lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
-            lab.setStyleSheet(f"color:{C['text']};")
-            desc = QLabel(desc_text)
-            desc.setFont(QFont("Segoe UI", 10))
-            desc.setStyleSheet(f"color:{C['text2']};")
-            cc.addWidget(lab); cc.addWidget(desc)
-            rl.addLayout(cc); rl.addStretch()
-            tog = Toggle(checked)
-            rl.addWidget(tog, alignment=Qt.AlignmentFlag.AlignVCenter)
-            return row, tog
+        # Email
+        sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(6); lo.addWidget(sep); lo.addSpacing(6)
+        lo.addWidget(self._section_label("EMAIL"))
+        self.new_email = QLineEdit(); self.new_email.setPlaceholderText("New email")
+        self.new_email.setFixedHeight(42); self.new_email.setStyleSheet(field()); lo.addWidget(self.new_email)
+        self.email_pw = QLineEdit(); self.email_pw.setPlaceholderText("Current password")
+        self.email_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.email_pw.setFixedHeight(42); self.email_pw.setStyleSheet(field()); lo.addWidget(self.email_pw)
+        self.email_status = QLabel(""); self.email_status.setFont(QFont("Segoe UI", 10))
+        self.email_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.email_status)
+        eb = btn("Change email", C["card"], C["text"], font_size=12)
+        eb.setFixedHeight(42); eb.clicked.connect(self._change_email); lo.addWidget(eb)
 
-        priv_row, self.priv_toggle = toggle_row(
+        # Password
+        sep2 = QFrame(); sep2.setFixedHeight(1); sep2.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(6); lo.addWidget(sep2); lo.addSpacing(6)
+        lo.addWidget(self._section_label("PASSWORD"))
+        self.cur_pw = QLineEdit(); self.cur_pw.setPlaceholderText("Current password")
+        self.cur_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.cur_pw.setFixedHeight(42); self.cur_pw.setStyleSheet(field()); lo.addWidget(self.cur_pw)
+        self.new_pw = QLineEdit(); self.new_pw.setPlaceholderText("New password")
+        self.new_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.new_pw.setFixedHeight(42); self.new_pw.setStyleSheet(field()); lo.addWidget(self.new_pw)
+        self.pw_status = QLabel(""); self.pw_status.setFont(QFont("Segoe UI", 10))
+        self.pw_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.pw_status)
+        pb = btn("Change password", C["card"], C["text"], font_size=12)
+        pb.setFixedHeight(42); pb.clicked.connect(self._change_password); lo.addWidget(pb)
+
+        # Danger zone
+        sep3 = QFrame(); sep3.setFixedHeight(1); sep3.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(6); lo.addWidget(sep3); lo.addSpacing(6)
+        dz = QLabel("DANGER ZONE")
+        dz.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        dz.setStyleSheet(f"color:{C['red']};letter-spacing:1px;")
+        lo.addWidget(dz)
+        del_btn = QPushButton("Delete my account")
+        del_btn.setFixedHeight(44)
+        del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        del_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['red']};
+            border:1.5px solid {C['red']};border-radius:10px;font-size:13px;
+            font-weight:bold;font-family:'Segoe UI';}}
+            QPushButton:hover{{background:{C['red']};color:white;}}""")
+        del_btn.clicked.connect(self._delete_account)
+        lo.addWidget(del_btn)
+        return page
+
+    # ── Page: Privacy ─────────────────────────────────────
+    def _page_privacy(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
+        lo.addWidget(self._page_title("Privacy"))
+        priv_row, self.priv_toggle = self._toggle_row(
             "Private profile", "Only friends can see your bio and message you",
             self.user.get("is_private", False))
         lo.addWidget(priv_row)
-        online_row, self.online_toggle = toggle_row(
+        online_row, self.online_toggle = self._toggle_row(
             "Show online status", "Others can see when you're online",
             self.user.get("show_online", True))
         lo.addWidget(online_row)
-        notif_row, self.notif_toggle = toggle_row(
-            "Notifications", "Sound and desktop alerts for new messages",
+        self.priv_status = QLabel(""); self.priv_status.setFont(QFont("Segoe UI", 11))
+        self.priv_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.priv_status)
+        save = btn("Save privacy", C["accent"], bold=True, font_size=13)
+        save.setFixedHeight(46); save.clicked.connect(self._save_privacy); lo.addWidget(save)
+        return page
+
+    # ── Page: Notifications ───────────────────────────────
+    def _page_notifications(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
+        lo.addWidget(self._page_title("Notifications"))
+        notif_row, self.notif_toggle = self._toggle_row(
+            "Enable notifications", "Sound and desktop alerts for new messages",
             getattr(self.app, "notifications_on", True) if self.app else True)
         lo.addWidget(notif_row)
         self.notif_toggle.toggled.connect(self.notif_changed.emit)
+        return page
 
-        # ── Call audio ────────────────────────────────────
-        sep2 = QFrame(); sep2.setFixedHeight(1); sep2.setStyleSheet(f"background:{C['divider']};border:none;")
-        lo.addSpacing(4); lo.addWidget(sep2); lo.addSpacing(4)
-        lo.addWidget(section_label("CALL AUDIO"))
-
+    # ── Page: Voice & Video ───────────────────────────────
+    def _page_voice(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
+        lo.addWidget(self._page_title("Voice & Video"))
         inputs, outputs = list_audio_devices()
-        lo.addWidget(small_label("🎤 Microphone"))
+        lo.addWidget(self._small_label("🎤 Microphone"))
         self.mic_combo = QComboBox(); self.mic_combo.setStyleSheet(self._combo_style())
         for idx, name in inputs:
             self.mic_combo.addItem(name, idx)
         lo.addWidget(self.mic_combo)
-        lo.addWidget(small_label("🔊 Speaker"))
+        lo.addWidget(self._small_label("🔊 Speaker"))
         self.spk_combo = QComboBox(); self.spk_combo.setStyleSheet(self._combo_style())
         for idx, name in outputs:
             self.spk_combo.addItem(name, idx)
@@ -1888,42 +2025,51 @@ class SettingsPage(QWidget):
         if cfg.get("speaker") is not None:
             i = self.spk_combo.findData(cfg["speaker"])
             if i >= 0: self.spk_combo.setCurrentIndex(i)
+        self.voice_status = QLabel(""); self.voice_status.setFont(QFont("Segoe UI", 11))
+        self.voice_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.voice_status)
+        save = btn("Save audio devices", C["accent"], bold=True, font_size=13)
+        save.setFixedHeight(46); save.clicked.connect(self._save_voice); lo.addWidget(save)
+        return page
 
-        # ── Status + Save ─────────────────────────────────
-        self.status = QLabel(""); self.status.setFont(QFont("Segoe UI", 11))
-        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lo.addSpacing(6); lo.addWidget(self.status)
-        save = btn("Save changes", C["accent"], bold=True, font_size=14)
-        save.setFixedHeight(48); save.clicked.connect(self._save); lo.addWidget(save)
+    # ── Page: Appearance ──────────────────────────────────
+    def _page_appearance(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
+        lo.addWidget(self._page_title("Appearance"))
+        info = QLabel("Theme customization is coming soon.\nVelo currently uses a dark theme.")
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{C['text2']};font-size:12px;font-family:'Segoe UI';")
+        lo.addWidget(info)
+        return page
 
-        # ── Logout ────────────────────────────────────────
-        sep3 = QFrame(); sep3.setFixedHeight(1); sep3.setStyleSheet(f"background:{C['divider']};border:none;")
-        lo.addSpacing(6); lo.addWidget(sep3); lo.addSpacing(6)
-        logout = QPushButton("Log out")
-        logout.setFixedHeight(46)
-        logout.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        logout.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['red']};
-            border:1.5px solid {C['red']};border-radius:10px;font-size:13px;
-            font-weight:bold;font-family:'Segoe UI';}}
-            QPushButton:hover{{background:{C['red']};color:white;}}""")
-        logout.clicked.connect(self.logout_requested.emit)
-        lo.addWidget(logout)
-        lo.addStretch()
+    # ── Page: About ───────────────────────────────────────
+    def _page_about(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
+        lo.addWidget(self._page_title("About Velo"))
+        if os.path.exists(LOGO_PATH):
+            logo = QLabel(); logo.setPixmap(make_rounded_logo(LOGO_PATH, 80))
+            logo.setFixedSize(80, 80); logo.setScaledContents(True)
+            lo.addWidget(logo, alignment=Qt.AlignmentFlag.AlignCenter)
+        name = QLabel("Velo"); name.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter); name.setStyleSheet(f"color:{C['text']};")
+        lo.addWidget(name)
+        ver = QLabel("Version 1.0  •  Fast and secure messaging")
+        ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ver.setStyleSheet(f"color:{C['text2']};font-size:11px;font-family:'Segoe UI';")
+        lo.addWidget(ver)
+        return page
 
+    # ── Avatar pick ───────────────────────────────────────
     def _pick(self):
         p, _ = QFileDialog.getOpenFileName(self, "Choose image", "", "Images (*.png *.jpg *.jpeg *.webp)")
         if p:
             self.avatar_path = p
             self.av_w.refresh(self.user.get("username", "?"), p)
 
-    def _save(self):
-        if hasattr(self, "mic_combo") and self.app:
-            self.app._save_audio_config(self.mic_combo.currentData(), self.spk_combo.currentData())
+    # ── Actions ───────────────────────────────────────────
+    def _save_profile(self):
         payload = {
             "username": self.un.text().strip(),
             "bio": self.bio.toPlainText().strip(),
-            "is_private": self.priv_toggle.isChecked(),
-            "show_online": self.online_toggle.isChecked(),
         }
         if self.avatar_path: payload["avatar_url"] = self.avatar_path
         try:
@@ -1932,14 +2078,106 @@ class SettingsPage(QWidget):
                 updated = r.json()
                 if self.avatar_path: updated["avatar_url"] = self.avatar_path
                 self.profile_updated.emit(updated)
-                self.status.setStyleSheet(f"color:{C['green']};")
-                self.status.setText("✓ Profile updated")
+                self.acc_status.setStyleSheet(f"color:{C['green']};")
+                self.acc_status.setText("✓ Profile updated")
             else:
-                self.status.setStyleSheet(f"color:{C['red']};")
-                self.status.setText("Update failed.")
+                self.acc_status.setStyleSheet(f"color:{C['red']};")
+                self.acc_status.setText("Update failed.")
         except Exception:
-            self.status.setStyleSheet(f"color:{C['red']};")
-            self.status.setText("Cannot reach server.")
+            self.acc_status.setStyleSheet(f"color:{C['red']};")
+            self.acc_status.setText("Cannot reach server.")
+
+    def _save_privacy(self):
+        payload = {
+            "is_private": self.priv_toggle.isChecked(),
+            "show_online": self.online_toggle.isChecked(),
+        }
+        try:
+            r = requests.patch(f"{BASE_URL}/auth/me", json=payload, headers=H(self.token))
+            if r.status_code == 200:
+                self.profile_updated.emit(r.json())
+                self.priv_status.setStyleSheet(f"color:{C['green']};")
+                self.priv_status.setText("✓ Privacy updated")
+            else:
+                self.priv_status.setStyleSheet(f"color:{C['red']};")
+                self.priv_status.setText("Update failed.")
+        except Exception:
+            self.priv_status.setStyleSheet(f"color:{C['red']};")
+            self.priv_status.setText("Cannot reach server.")
+
+    def _save_voice(self):
+        if self.app:
+            self.app._save_audio_config(self.mic_combo.currentData(), self.spk_combo.currentData())
+            self.voice_status.setStyleSheet(f"color:{C['green']};")
+            self.voice_status.setText("✓ Audio devices saved")
+
+    def _change_email(self):
+        new_email = self.new_email.text().strip()
+        pw = self.email_pw.text()
+        if not new_email or not pw:
+            self.email_status.setStyleSheet(f"color:{C['red']};")
+            self.email_status.setText("Fill both fields.")
+            return
+        try:
+            r = requests.post(f"{BASE_URL}/auth/change_email",
+                              json={"new_email": new_email, "password": pw}, headers=H(self.token))
+            if r.status_code == 200:
+                self.email_status.setStyleSheet(f"color:{C['green']};")
+                self.email_status.setText("✓ Email changed")
+                self.new_email.clear(); self.email_pw.clear()
+            elif r.status_code == 401:
+                self.email_status.setStyleSheet(f"color:{C['red']};")
+                self.email_status.setText("Wrong password.")
+            elif r.status_code == 400:
+                self.email_status.setStyleSheet(f"color:{C['red']};")
+                self.email_status.setText("Email already in use.")
+            else:
+                self.email_status.setStyleSheet(f"color:{C['red']};")
+                self.email_status.setText("Failed.")
+        except Exception:
+            self.email_status.setStyleSheet(f"color:{C['red']};")
+            self.email_status.setText("Cannot reach server.")
+
+    def _change_password(self):
+        cur = self.cur_pw.text(); new = self.new_pw.text()
+        if not cur or not new:
+            self.pw_status.setStyleSheet(f"color:{C['red']};")
+            self.pw_status.setText("Fill both fields.")
+            return
+        try:
+            r = requests.post(f"{BASE_URL}/auth/change_password",
+                              json={"current_password": cur, "new_password": new}, headers=H(self.token))
+            if r.status_code == 200:
+                self.pw_status.setStyleSheet(f"color:{C['green']};")
+                self.pw_status.setText("✓ Password changed")
+                self.cur_pw.clear(); self.new_pw.clear()
+            elif r.status_code == 401:
+                self.pw_status.setStyleSheet(f"color:{C['red']};")
+                self.pw_status.setText("Wrong current password.")
+            else:
+                self.pw_status.setStyleSheet(f"color:{C['red']};")
+                self.pw_status.setText("Failed.")
+        except Exception:
+            self.pw_status.setStyleSheet(f"color:{C['red']};")
+            self.pw_status.setText("Cannot reach server.")
+
+    def _delete_account(self):
+        pw, ok = QInputDialog.getText(self, "Delete account",
+            "This is permanent. Enter your password to confirm:",
+            echo=QLineEdit.EchoMode.Password)
+        if not ok or not pw:
+            return
+        try:
+            r = requests.post(f"{BASE_URL}/auth/delete_account",
+                              json={"password": pw}, headers=H(self.token))
+            if r.status_code == 200:
+                self.account_deleted.emit()
+            elif r.status_code == 401:
+                QMessageBox.warning(self, "Delete account", "Wrong password.")
+            else:
+                QMessageBox.warning(self, "Delete account", "Failed to delete account.")
+        except Exception:
+            QMessageBox.warning(self, "Delete account", "Cannot reach server.")
 
 
 # ── Main window ───────────────────────────────────────────
@@ -3170,8 +3408,15 @@ class VeloApp(QMainWindow):
         self.settings_page.notif_changed.connect(self._set_notifications)
         self.settings_page.closed.connect(self._close_settings)
         self.settings_page.logout_requested.connect(self._logout)
+        self.settings_page.account_deleted.connect(self._on_account_deleted)
         self.stack.addWidget(self.settings_page)
         self.stack.setCurrentWidget(self.settings_page)
+
+    def _on_account_deleted(self):
+        # Compte supprimé → efface le token et retourne au login
+        clear_token()
+        QMessageBox.information(self, "Account deleted", "Your account has been deleted.")
+        self._logout()
 
     def _close_settings(self):
         self.stack.setCurrentIndex(0)
