@@ -170,6 +170,56 @@ async def get_conversation(
     )
     return result.scalars().all()
 
+class EditMessageData(BaseModel):
+    message_id: int
+    new_content: str
+
+class DeleteMessageData(BaseModel):
+    message_id: int
+
+
+@router.post("/edit_message")
+async def edit_message(
+    data: EditMessageData,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    my_id = current_user.id
+    result = await db.execute(select(Message).where(Message.id == data.message_id))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.sender_id != my_id:
+        raise HTTPException(403, "Not your message")
+    msg.content = data.new_content
+    msg.edited = True
+    receiver_id = msg.receiver_id
+    await db.commit()
+    # Notifie le destinataire en temps réel
+    await manager.send_to_user(receiver_id, f"[EDIT]{data.message_id}|{data.new_content}")
+    return {"status": "ok"}
+
+
+@router.post("/delete_message")
+async def delete_message(
+    data: DeleteMessageData,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    my_id = current_user.id
+    result = await db.execute(select(Message).where(Message.id == data.message_id))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.sender_id != my_id:
+        raise HTTPException(403, "Not your message")
+    receiver_id = msg.receiver_id
+    await db.delete(msg)
+    await db.commit()
+    # Notifie le destinataire
+    await manager.send_to_user(receiver_id, f"[DELETE]{data.message_id}")
+    return {"status": "ok"}
+
 
 #gestionnaire de connexion
 class ConnectionManager:

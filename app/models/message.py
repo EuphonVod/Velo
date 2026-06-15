@@ -12,4 +12,5 @@ class Message(Base):
     content: Mapped[str] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default=datetime.now)
     is_read: Mapped[bool] = mapped_column(default=False)
+    edited: Mapped[bool] = mapped_column(default=False, nullable=True)
 
