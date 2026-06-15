@@ -112,18 +112,18 @@ async def get_history(user_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/mark_read")
 async def mark_read(data: MarkReadData, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
     from sqlalchemy import update
+    my_id = current_user.id  # capture avant le commit
     await db.execute(
         update(Message)
         .where(
             (Message.sender_id == data.other_user_id) &
-            (Message.receiver_id == current_user.id) &
+            (Message.receiver_id == my_id) &
             (Message.is_read == False)
         )
         .values(is_read=True)
     )
     await db.commit()
-    # Notifie l'expéditeur en temps réel que ses messages sont lus
-    await manager.send_to_user(data.other_user_id, f"[READ]{current_user.id}")
+    await manager.send_to_user(data.other_user_id, f"[READ]{my_id}")
     return {"status": "ok"}
 
 @router.post("/upload_file")
