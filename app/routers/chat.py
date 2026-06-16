@@ -1,3 +1,4 @@
+import bcrypt
 from fastapi import APIRouter, WebSocket, Depends
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +11,7 @@ from datetime import datetime
 
 from app.database import AsyncSessionLocal
 from app.dependencies import get_db
+from app.models.group import GroupMessage
 from app.models.message import Message
 from app.models.user import User
 from pydantic import BaseModel
@@ -19,6 +21,7 @@ import uuid
 from fastapi import UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 
+from app.schemas.user import NukeMessages
 
 router = APIRouter()
 
@@ -225,19 +228,26 @@ async def delete_message(
     await manager.send_to_user(receiver_id, f"[DELETE]{data.message_id}")
     return {"status": "ok"}
 
-@router.post("/nuke_message")
-async def nuke_message(
-        data: DeleteMessageData,
+from sqlalchemy import delete  # à ajouter en haut du fichier si pas déjà présent
+
+@router.post("/nuke_messages")
+async def nuke_messages(
+        data: NukeMessages,
         db: AsyncSession = Depends(get_db),
         current_user=Depends(get_current_user),
 ):
     my_id = current_user.id
-    result = await db.execute(
-        select(Message).where(Message.sender_id == my_id).order_by(Message.created_at.desc())  )
-    message = result.scalars().all()
-    await db.delete(message)
+    #verifie mdp avant
+    result = await db.execute(select(User).where(User.id == my_id))
+    user_db = result.scalar_one_or_none()
+    if not bcrypt.checkpw(data.password.encode("utf-8"),
+                          user_db.hashed_password.encode("utf-8")):
+        raise HTTPException(status_code=401, detail="Wrong password")
+    # Suppression en masse : DM + messages de groupe
+    dm = await db.execute(delete(Message).where(Message.sender_id == my_id))
+    gm = await db.execute(delete(GroupMessage).where(GroupMessage.sender_id == my_id))
     await db.commit()
-    return  {"status": "ok"}
+    return {"status": "ok", "deleted": dm.rowcount + gm.rowcount}
 
 
 #gestionnaire de connexion

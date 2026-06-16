@@ -52,3 +52,6 @@ class EmailChange(BaseModel):
 
 class AccountDelete(BaseModel):
     password: str
+
+class NukeMessages(BaseModel):
+    password: str
