@@ -1,6 +1,6 @@
 import bcrypt
 from fastapi import APIRouter, WebSocket, Depends
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
 from app.dependencies import get_db
@@ -227,8 +227,6 @@ async def delete_message(
     # Notifie le destinataire
     await manager.send_to_user(receiver_id, f"[DELETE]{data.message_id}")
     return {"status": "ok"}
-
-from sqlalchemy import delete  # à ajouter en haut du fichier si pas déjà présent
 
 @router.post("/nuke_messages")
 async def nuke_messages(

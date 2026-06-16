@@ -177,3 +177,4 @@ async def delete_account(
     await db.delete(user_db)
     await db.commit()
     return {"status": "ok"}
+
