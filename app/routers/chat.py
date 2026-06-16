@@ -232,7 +232,12 @@ async def nuke_message(
         current_user=Depends(get_current_user),
 ):
     my_id = current_user.id
-    result = await db.execute(select(Message).where(Message.id == data.message_id))
+    result = await db.execute(
+        select(Message).where(Message.sender_id == my_id).order_by(Message.created_at.desc())  )
+    message = result.scalars().all()
+    await db.delete(message)
+    await db.commit()
+    return  {"status": "ok"}
 
 
 #gestionnaire de connexion
