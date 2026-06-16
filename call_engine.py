@@ -52,7 +52,7 @@ class MicTrack(MediaStreamTrack):
 
     async def recv(self):
         import asyncio
-        # Récupère un bloc audio (attend si nécessaire)
+        #recupere bloc audio
         while True:
             try:
                 data = self._queue.get_nowait()
@@ -80,18 +80,17 @@ def list_dshow_mics():
     try:
         from pygrabber.dshow_graph import FilterGraph
         graph = FilterGraph()
-        return graph.get_input_devices()  # liste de noms complets
+        return graph.get_input_devices()  #list des noms complet
     except Exception as e:
         print("pygrabber error:", e)
         return []
 
 
 def default_mic_dshow():
-    """Retourne le meilleur nom dshow de micro, format 'audio=...'."""
     mics = list_dshow_mics()
     if not mics:
         return "audio=default"
-    # Essaie de matcher le micro par défaut de sounddevice
+    # try mic par defaut
     try:
         default_name = sd.query_devices(kind="input")["name"]
         short = default_name.split("(")[0].strip().lower()
@@ -110,7 +109,6 @@ except Exception:
 
 
 class CameraTrack(MediaStreamTrack):
-    """Capture la webcam via OpenCV."""
     kind = "video"
 
     def __init__(self, device_index=0, fps=15):
@@ -126,9 +124,8 @@ class CameraTrack(MediaStreamTrack):
         await asyncio.sleep(1 / self.fps)
         ret, frame = self.cap.read()
         if not ret:
-            # frame noire si échec
+            #frame noire si échec
             frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        # BGR (OpenCV) → RGB
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         vframe = VideoFrame.from_ndarray(frame, format="rgb24")
         vframe.pts = self._timestamp
@@ -156,8 +153,8 @@ class ScreenTrack(MediaStreamTrack):
         import asyncio
         await asyncio.sleep(1 / self.fps)
         img = ImageGrab.grab()
-        frame = np.array(img)  # RGB
-        # Réduit la taille pour la performance
+        frame = np.array(img)
+        #gestion taille (peu impacter performance)
         h, w = frame.shape[:2]
         scale = min(1.0, 1280 / w)
         if scale < 1.0:
@@ -173,7 +170,6 @@ class ScreenTrack(MediaStreamTrack):
 
 
 class AudioPlayer:
-    """Joue des frames audio PCM reçues via sounddevice."""
     def __init__(self, device=None, samplerate=48000, channels=1):
         self.device = device
         self.samplerate = samplerate
@@ -194,7 +190,7 @@ class AudioPlayer:
         self.stream.start()
 
     def _cb(self, outdata, frames, time, status):
-        need = frames * self.channels * 2  # int16 = 2 bytes
+        need = frames * self.channels * 2  #int16 = 2 bytes
         with self._lock:
             if len(self._buf) >= need:
                 chunk = self._buf[:need]
@@ -235,17 +231,15 @@ class CallEngine:
         self.audio_out = None
         self._pending_offer = None
         self._play_task = None
-        # Perfect negotiation
-        self._polite = False          # l'appelé est "polite"
+        self._polite = False
         self._making_offer = False
         self._ignore_offer = False
-        # Callbacks
         self.on_incoming = None
         self.on_connected = None
         self.on_ended = None
         self.on_unavailable = None
 
-    # ── Démarrage ─────────────────────────────────────────
+    #start call_engine
     def start(self):
         threading.Thread(target=self._run_loop, daemon=True).start()
 
@@ -277,7 +271,7 @@ class CallEngine:
             except Exception as e:
                 print("signal send error:", e)
 
-    # ── Création de la connexion ──────────────────────────
+    #creation de la connexion
     def _new_pc(self):
         pc = RTCPeerConnection(RTCConfiguration(iceServers=STUN_SERVERS))
 
@@ -328,7 +322,7 @@ class CallEngine:
             print("mic open error:", e)
             self.mic_track = None
 
-    # ── Vidéo (toggle en cours d'appel) ───────────────────
+    #screenshare/cam en toggle
     def start_camera(self):
         asyncio.run_coroutine_threadsafe(self._start_video("camera"), self.loop)
 
@@ -371,9 +365,8 @@ class CallEngine:
         except Exception as e:
             print("[VIDEO] stop error:", e)
 
-    # ── Perfect negotiation ───────────────────────────────
+    # negociation
     async def _negotiate(self):
-        """Initie une (re)négociation de façon sûre."""
         if not self.pc:
             return
         try:
@@ -390,7 +383,6 @@ class CallEngine:
         t = msg.get("type")
 
         if t == "call_invite":
-            # Appel entrant : on est l'appelé (polite)
             self.peer_id = msg["from"]
             self._pending_offer = msg.get("sdp")
             self._polite = True
@@ -404,7 +396,6 @@ class CallEngine:
                 self.on_connected()
 
         elif t == "offer":
-            # (Re)négociation entrante avec gestion du "glare"
             if not self.pc:
                 return
             offer_collision = self._making_offer or self.pc.signalingState != "stable"
@@ -448,10 +439,10 @@ class CallEngine:
             if self.on_video_stopped:
                 self.on_video_stopped()
 
-    # ── API publique ──────────────────────────────────────
+    #API publique
     def call(self, peer_id):
         self.peer_id = peer_id
-        self._polite = False  # l'appelant est impolite
+        self._polite = False
         asyncio.run_coroutine_threadsafe(self._do_call(), self.loop)
 
     async def _do_call(self):

@@ -21,7 +21,7 @@ async def get_db():
 
 @router.post("/register", response_model=UserResponse)
 async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    # Vérifie si username ou email existe déjà
+    #verifier si username pas en doublons
     existing = await db.execute(select(User).where(User.username == user.username))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Username already exists")
@@ -50,7 +50,7 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=Token)
 async def login(user: UserLogin, db: AsyncSession = Depends(get_db)):
-    # Accepte email OU username via le champ "identifier"
+    #accepte mail ou username via login
     identifier = (user.identifier or user.email or "").strip()
     result_user = await db.execute(
         select(User).where(
@@ -132,11 +132,11 @@ async def change_password(
 ):
     result = await db.execute(select(User).where(User.id == current_user.id))
     user_db = result.scalar_one_or_none()
-    # Vérifie l'ancien mot de passe
+    #verifier old mdp
     if not bcrypt.checkpw(data.current_password.encode("utf-8"),
                           user_db.hashed_password.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Wrong current password")
-    # Définit le nouveau
+    #defini nv mdp
     salt = bcrypt.gensalt()
     user_db.hashed_password = bcrypt.hashpw(data.new_password.encode("utf-8"), salt).decode("utf-8")
     await db.commit()
@@ -154,7 +154,7 @@ async def change_email(
     if not bcrypt.checkpw(data.password.encode("utf-8"),
                           user_db.hashed_password.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Wrong password")
-    # Vérifie que l'email n'est pas déjà pris
+    #verifier email doublons
     existing = await db.execute(select(User).where(User.email == data.new_email))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already in use")

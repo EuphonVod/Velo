@@ -26,7 +26,7 @@ class FriendRequestInfo(BaseModel):
     user: UserResponse
 
 
-# ── Recherche d'utilisateurs par @username ────────────────
+#find user par @username
 @router.get("/search", response_model=list[UserResponse])
 async def search_users(
     q: str,
@@ -43,7 +43,7 @@ async def search_users(
     return users
 
 
-# ── Statut de relation avec un utilisateur ────────────────
+#status de relation entre deux users
 @router.get("/status/{user_id}")
 async def friendship_status(
     user_id: int,
@@ -71,7 +71,7 @@ async def friendship_status(
     return {"status": "request_received", "friendship_id": fr.id}
 
 
-# ── Envoyer une demande d'ami ─────────────────────────────
+#send friend request
 @router.post("/request")
 async def send_request(
     data: FriendRequestAction,
@@ -104,7 +104,7 @@ async def send_request(
     return {"status": "request_sent"}
 
 
-# ── Accepter une demande ──────────────────────────────────
+#accepter friend request
 @router.post("/accept")
 async def accept_request(
     data: FriendRequestAction,
@@ -129,7 +129,7 @@ async def accept_request(
     return {"status": "friends"}
 
 
-# ── Refuser / annuler une demande ─────────────────────────
+#refuser/annuler friend request
 @router.post("/decline")
 async def decline_request(
     data: FriendRequestAction,
@@ -153,7 +153,7 @@ async def decline_request(
     return {"status": "none"}
 
 
-# ── Liste des amis ────────────────────────────────────────
+#friend list
 @router.get("/list", response_model=list[UserResponse])
 async def list_friends(
     current_user: User = Depends(get_current_user),
@@ -181,7 +181,7 @@ async def list_friends(
     return res.scalars().all()
 
 
-# ── Demandes reçues (en attente) ──────────────────────────
+#friend request en attente
 @router.get("/requests", response_model=list[FriendRequestInfo])
 async def pending_requests(
     current_user: User = Depends(get_current_user),

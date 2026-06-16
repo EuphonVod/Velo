@@ -20,7 +20,7 @@ def _ordered(a, b):
     return (a, b) if a < b else (b, a)
 
 
-# ── Lire le réglage d'une conversation ────────────────────
+#lire settings d'une conv
 @router.get("/settings/{other_user_id}")
 async def get_settings(
     other_user_id: int,
@@ -38,7 +38,7 @@ async def get_settings(
     return {"ephemeral": cs.ephemeral if cs else False}
 
 
-# ── Changer le réglage ────────────────────────────────────
+#modifier settings
 @router.post("/settings")
 async def set_settings(
     data: EphemeralUpdate,
@@ -62,7 +62,7 @@ async def set_settings(
     return {"ephemeral": data.ephemeral}
 
 
-# ── Supprimer les messages lus ───────────
+#delete msg lu si settings on del after reading
 @router.post("/clear_read/{other_user_id}")
 async def clear_read(
     other_user_id: int,
@@ -70,7 +70,7 @@ async def clear_read(
     db: AsyncSession = Depends(get_db),
 ):
     a, b = _ordered(current_user.id, other_user_id)
-    # Vérifie que le mode éphémère est actif
+    #verifi mode del on read
     res = await db.execute(
         select(ConversationSettings).where(and_(
             ConversationSettings.user_a_id == a,
@@ -80,7 +80,7 @@ async def clear_read(
     cs = res.scalar_one_or_none()
     if not cs or not cs.ephemeral:
         return {"deleted": 0}
-    # Supprime les messages lus entre les deux utilisateurs
+    #delete les messages aux deux users
     await db.execute(
         delete(Message).where(and_(
             Message.is_read == True,

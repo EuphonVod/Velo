@@ -15,7 +15,7 @@ from app.models.group import Group, GroupMember, GroupMessage, GroupInvite, Grou
 router = APIRouter()
 
 
-# ── Schemas ───────────────────────────────────────────────
+#schemas
 class GroupCreate(BaseModel):
     name: str
     is_private: bool = False
@@ -54,7 +54,7 @@ class ModAction(BaseModel):
 
 class BanAction(BaseModel):
     user_id: int
-    days: int = 0  # 0 = permanent
+    days: int = 0  #0 = permanent
 
 
 async def _get_role(db, group_id, user_id):
@@ -86,14 +86,14 @@ async def _is_banned(db, group_id, user_id):
     return True
 
 
-# ── Créer un groupe ───────────────────────────────────────
+#create group
 @router.post("/create", response_model=GroupOut)
 async def create_group(
     data: GroupCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    owner_id = current_user.id  # capture avant
+    owner_id = current_user.id
     g = Group(
         name=data.name,
         bio=data.bio,
@@ -103,7 +103,7 @@ async def create_group(
     db.add(g)
     await db.commit()
     await db.refresh(g)
-    group_id = g.id  # capture avant
+    group_id = g.id
     member = GroupMember(group_id=group_id, user_id=owner_id, role="owner")
     db.add(member)
     await db.commit()
@@ -111,7 +111,7 @@ async def create_group(
     return g
 
 
-# ── Mes groupes ───────────────────────────────────────────
+#mes groupes
 @router.get("/my", response_model=list[GroupOut])
 async def my_groups(
     current_user: User = Depends(get_current_user),
@@ -127,7 +127,7 @@ async def my_groups(
     return res.scalars().all()
 
 
-# ── Détails d'un groupe ───────────────────────────────────
+#detail d'un grp
 @router.get("/{group_id}", response_model=GroupOut)
 async def get_group(
     group_id: int,
@@ -141,7 +141,7 @@ async def get_group(
     return g
 
 
-# ── Membres d'un groupe ───────────────────────────────────
+#membre d'un grp
 @router.get("/{group_id}/members", response_model=list[MemberOut])
 async def group_members(
     group_id: int,
@@ -167,7 +167,7 @@ async def group_members(
     return out
 
 
-# ── Historique des messages du groupe ─────────────────────
+#historique msg du grp
 @router.get("/{group_id}/history")
 async def group_history(
     group_id: int,
@@ -192,7 +192,7 @@ async def group_history(
         })
     return out
 
-# ── Quitter un groupe ─────────────────────────────────────
+#leave un grp
 @router.post("/{group_id}/leave")
 async def leave_group(
     group_id: int,
@@ -214,7 +214,7 @@ async def leave_group(
     return {"status": "left"}
 
 
-# ── Modifier le groupe (owner/admin) ──────────────────────
+#modifier grp si admin/owner
 @router.patch("/{group_id}", response_model=GroupOut)
 async def update_group(
     group_id: int,
@@ -222,7 +222,7 @@ async def update_group(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # Vérifie le rôle
+    #verifie role (owner/admin)
     res = await db.execute(
         select(GroupMember).where(and_(
             GroupMember.group_id == group_id,
@@ -243,7 +243,7 @@ async def update_group(
     await db.refresh(g)
     return g
 
-# ── Rechercher des groupes publics par nom ────────────────
+#recherche grp public par nom
 @router.get("/search/public", response_model=list[GroupOut])
 async def search_public_groups(
     q: str,
@@ -262,7 +262,7 @@ async def search_public_groups(
     return res.scalars().all()
 
 
-# ── Rejoindre un groupe public ────────────────────────────
+#join public grp
 @router.post("/{group_id}/join")
 async def join_group(
     group_id: int,
@@ -277,7 +277,7 @@ async def join_group(
         raise HTTPException(403, "This group is private, you need an invitation")
     if await _is_banned(db, group_id, current_user.id):
         raise HTTPException(403, "You are banned from this group")
-    # Déjà membre ?
+    #deja membre du grp?
     existing = await db.execute(
         select(GroupMember).where(and_(
             GroupMember.group_id == group_id,
@@ -291,7 +291,7 @@ async def join_group(
     await db.commit()
     return {"status": "joined"}
 
-# ── Inviter quelqu'un (owner/admin, groupe privé) ─────────
+#inviter qqn dans grp privé si admin/owner
 @router.post("/{group_id}/invite")
 async def invite_to_group(
     group_id: int,
@@ -308,7 +308,7 @@ async def invite_to_group(
     m = res.scalar_one_or_none()
     if not m or m.role not in ("owner", "admin"):
         raise HTTPException(403, "Only owner/admin can invite")
-    # Déjà membre ?
+    #deja membre?
     ex = await db.execute(
         select(GroupMember).where(and_(
             GroupMember.group_id == group_id,
@@ -317,7 +317,7 @@ async def invite_to_group(
     )
     if ex.scalar_one_or_none():
         raise HTTPException(400, "Already a member")
-    # Envoie un message DM spécial (carte invitation)
+    #envoie invite grp en dm
     from app.models.message import Message
     invite_msg = Message(
         sender_id=current_user.id,
@@ -329,7 +329,7 @@ async def invite_to_group(
     return {"status": "invited"}
 
 
-# ── Mes invitations reçues ────────────────────────────────
+#mes invites recu
 @router.get("/invites/mine")
 async def my_invites(
     current_user: User = Depends(get_current_user),
@@ -350,7 +350,7 @@ async def my_invites(
     return out
 
 
-# ── Accepter une invitation ───────────────────────────────
+#accept invite grp private
 @router.post("/invites/{invite_id}/accept")
 async def accept_invite(
     invite_id: int,
@@ -368,7 +368,7 @@ async def accept_invite(
     return {"status": "joined"}
 
 
-# ── Refuser une invitation ────────────────────────────────
+#refuser invite
 @router.post("/invites/{invite_id}/decline")
 async def decline_invite(
     invite_id: int,
@@ -390,7 +390,7 @@ async def join_invited(
 ):
     if await _is_banned(db, group_id, current_user.id):
         raise HTTPException(403, "You are banned from this group")
-    # Déjà membre ?
+    #deja membre?
     ex = await db.execute(
         select(GroupMember).where(and_(
             GroupMember.group_id == group_id,
@@ -404,7 +404,7 @@ async def join_invited(
     await db.commit()
     return {"status": "joined"}
 
-# ── Promouvoir admin (owner only) ─────────────────────────
+#promouvoir admin
 @router.post("/{group_id}/promote")
 async def promote(
     group_id: int, data: ModAction,
@@ -428,7 +428,7 @@ async def promote(
     return {"status": "promoted"}
 
 
-# ── Rétrograder admin (owner only) ────────────────────────
+#retrograder (seulement owner)
 @router.post("/{group_id}/demote")
 async def demote(
     group_id: int, data: ModAction,
@@ -449,7 +449,7 @@ async def demote(
     return {"status": "demoted"}
 
 
-# ── Exclure (kick) ────────────────────────────────────────
+#kick someone
 @router.post("/{group_id}/kick")
 async def kick(
     group_id: int, data: ModAction,
@@ -475,7 +475,7 @@ async def kick(
     return {"status": "kicked"}
 
 
-# ── Bannir (kick + empêche de revenir) ────────────────────
+#ban someone
 @router.post("/{group_id}/ban")
 async def ban(
     group_id: int, data: BanAction,
@@ -490,7 +490,7 @@ async def ban(
         raise HTTPException(403, "Cannot ban the owner")
     if my_role == "admin" and target_role == "admin":
         raise HTTPException(403, "Admins cannot ban other admins")
-    # Retire de la liste des membres
+    #remove from friend list
     res = await db.execute(
         select(GroupMember).where(and_(
             GroupMember.group_id == group_id,
@@ -499,7 +499,7 @@ async def ban(
     )
     m = res.scalar_one_or_none()
     if m: await db.delete(m)
-    # Crée le ban
+    #create ban
     until = None
     if data.days > 0:
         until = datetime.now() + timedelta(days=data.days)

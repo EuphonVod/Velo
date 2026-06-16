@@ -803,16 +803,13 @@ class LoginDialog(QDialog):
         lo.addStretch()
         icon = QLabel()
         if os.path.exists(LOGO_PATH):
-            icon.setPixmap(make_rounded_logo(LOGO_PATH, 124))
+            icon.setPixmap(make_rounded_logo(LOGO_PATH, 112))
         else:
-            icon.setText("✈");
-            icon.setFont(QFont("Segoe UI Emoji", 52))
+            icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 52))
             icon.setStyleSheet(f"color:{C['accent']};")
-        icon.setFixedSize(104, 104)
-        icon.setScaledContents(True)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
-        lo.addSpacing(32)
+        lo.addSpacing(20)
         t = QLabel("Velo"); t.setFont(QFont("Segoe UI", 27, QFont.Weight.Bold))
         t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
         lo.addWidget(t)
@@ -1987,6 +1984,17 @@ class SettingsPage(QWidget):
         dz.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         dz.setStyleSheet(f"color:{C['red']};letter-spacing:1px;")
         lo.addWidget(dz)
+        # Supprimer tous ses messages
+        nuke_btn = QPushButton("Delete all my messages")
+        nuke_btn.setFixedHeight(44)
+        nuke_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        nuke_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['orange']};
+            border:1.5px solid {C['orange']};border-radius:10px;font-size:13px;
+            font-weight:bold;font-family:'Segoe UI';}}
+            QPushButton:hover{{background:{C['orange']};color:white;}}""")
+        nuke_btn.clicked.connect(self._nuke_messages)
+        lo.addWidget(nuke_btn)
+        # Supprimer le compte
         del_btn = QPushButton("Delete my account")
         del_btn.setFixedHeight(44)
         del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -2202,6 +2210,34 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "Delete account", "Failed to delete account.")
         except Exception:
             QMessageBox.warning(self, "Delete account", "Cannot reach server.")
+
+    def _nuke_messages(self):
+        #confirmation dabord
+        confirm = QMessageBox.question(self, "Delete all messages",
+            "This will permanently delete ALL messages you've sent "
+            "(direct messages and group messages). This cannot be undone.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        #mdp en confirmation
+        pw, ok = QInputDialog.getText(self, "Delete all messages",
+            "Enter your password to confirm:",
+            echo=QLineEdit.EchoMode.Password)
+        if not ok or not pw:
+            return
+        try:
+            r = requests.post(f"{BASE_URL}/chat/nuke_messages",
+                              json={"password": pw}, headers=H(self.token))
+            if r.status_code == 200:
+                n = r.json().get("deleted", 0)
+                QMessageBox.information(self, "Delete all messages",
+                    f"✓ {n} message(s) deleted.")
+            elif r.status_code == 401:
+                QMessageBox.warning(self, "Delete all messages", "Wrong password.")
+            else:
+                QMessageBox.warning(self, "Delete all messages", "Failed.")
+        except Exception:
+            QMessageBox.warning(self, "Delete all messages", "Cannot reach server.")
 
 
 # ── Main window ───────────────────────────────────────────

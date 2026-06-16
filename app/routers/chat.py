@@ -47,7 +47,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
         while True:
             data = await websocket.receive_text()
             receiver_id, message = data.split(":", 1)
-            # Les signaux typing ne sont pas sauvegardés
+            #les signaux typing ne sont pas saved
             if message == "[TYPING]" or message == "[STOP_TYPING]":
                 await manager.send_to_user(int(receiver_id), f"{user_id}:{message}")
                 continue
@@ -120,7 +120,7 @@ async def get_history(user_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/mark_read")
 async def mark_read(data: MarkReadData, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
     from sqlalchemy import update
-    my_id = current_user.id  # capture avant le commit
+    my_id = current_user.id
     await db.execute(
         update(Message)
         .where(
@@ -142,7 +142,7 @@ async def upload_file(file: UploadFile = File(...), current_user=Depends(get_cur
     content = await file.read()
     with open(path, "wb") as f:
         f.write(content)
-    # Détermine le type
+    #determiner type de file
     if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
         ftype = "image"
     elif ext in (".mp4", ".webm", ".mov", ".avi", ".mkv"):
@@ -203,7 +203,7 @@ async def edit_message(
     msg.edited = True
     receiver_id = msg.receiver_id
     await db.commit()
-    # Notifie le destinataire en temps réel
+    #previens autre user que msg edited
     await manager.send_to_user(receiver_id, f"[EDIT]{data.message_id}|{data.new_content}")
     return {"status": "ok"}
 
@@ -224,7 +224,7 @@ async def delete_message(
     receiver_id = msg.receiver_id
     await db.delete(msg)
     await db.commit()
-    # Notifie le destinataire
+    #previens autre user que msg supprimer
     await manager.send_to_user(receiver_id, f"[DELETE]{data.message_id}")
     return {"status": "ok"}
 
@@ -266,7 +266,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# Gestionnaire de connexions pour les groupes
+#gestionnaire de connexions pour les groups
 class GroupConnectionManager:
     def __init__(self):
         # {group_id: {user_id: websocket}}
