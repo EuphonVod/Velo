@@ -807,9 +807,11 @@ class LoginDialog(QDialog):
         else:
             icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 52))
             icon.setStyleSheet(f"color:{C['accent']};")
+        icon.setFixedSize(104, 104)
+        icon.setScaledContents(True)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
-        lo.addSpacing(20)
+        lo.addSpacing(32)
         t = QLabel("Velo"); t.setFont(QFont("Segoe UI", 27, QFont.Weight.Bold))
         t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
         lo.addWidget(t)
