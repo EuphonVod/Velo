@@ -225,6 +225,15 @@ async def delete_message(
     await manager.send_to_user(receiver_id, f"[DELETE]{data.message_id}")
     return {"status": "ok"}
 
+@router.post("/nuke_message")
+async def nuke_message(
+        data: DeleteMessageData,
+        db: AsyncSession = Depends(get_db),
+        current_user=Depends(get_current_user),
+):
+    my_id = current_user.id
+    result = await db.execute(select(Message).where(Message.id == data.message_id))
+
 
 #gestionnaire de connexion
 class ConnectionManager:

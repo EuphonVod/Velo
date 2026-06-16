@@ -137,7 +137,22 @@ def avatar_color(name):
     return AVATAR_PALETTE[sum(ord(c) for c in name) % len(AVATAR_PALETTE)]
 
 
+_AVATAR_CACHE = {}
+
 def make_avatar(name, size, image_path=""):
+    # Cache : évite de redessiner le même avatar plusieurs fois
+    # Pour les images, on inclut la date de modif pour rafraîchir si le fichier change
+    mtime = ""
+    if image_path and os.path.exists(image_path):
+        try:
+            mtime = str(os.path.getmtime(image_path))
+        except Exception:
+            mtime = ""
+    cache_key = (name, size, image_path, mtime)
+    cached = _AVATAR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     px = QPixmap(size, size)
     px.fill(Qt.GlobalColor.transparent)
     p = QPainter(px)
@@ -147,7 +162,6 @@ def make_avatar(name, size, image_path=""):
     p.setClipPath(path)
     if image_path and os.path.exists(image_path):
         src = QPixmap(image_path)
-        # Scale so the shorter side fills `size`, then center-crop
         scaled = src.scaled(size, size,
             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
             Qt.TransformationMode.SmoothTransformation)
@@ -164,6 +178,10 @@ def make_avatar(name, size, image_path=""):
         p.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter,
                    (name[0] if name else "?").upper())
     p.end()
+    # Limite la taille du cache (évite la fuite mémoire)
+    if len(_AVATAR_CACHE) > 200:
+        _AVATAR_CACHE.clear()
+    _AVATAR_CACHE[cache_key] = px
     return px
 
 
@@ -299,7 +317,7 @@ class Bubble(QWidget):
     delete_requested = pyqtSignal(int)      # (message_id)
 
     def __init__(self, text, outgoing, msg_id=None, edited=False, parent=None,
-                 sender_name=None, sender_avatar=None, time_str=None):
+                 sender_name=None, sender_avatar=None, time_str=None, indent=False):
         super().__init__(parent)
         self.msg_id = msg_id
         self.outgoing = outgoing
@@ -319,6 +337,9 @@ class Bubble(QWidget):
             avw = QWidget(); avw.setFixedSize(34, 34)
             avl = QVBoxLayout(avw); avl.setContentsMargins(0, 0, 0, 0)
             avl.addWidget(av)
+        elif indent and not outgoing:
+            # Espace réservé pour aligner les messages groupés (même expéditeur)
+            avw = QWidget(); avw.setFixedSize(34, 1)
 
         # Bulle : conteneur vertical compact
         bubble = QWidget()
@@ -784,11 +805,14 @@ class LoginDialog(QDialog):
         if os.path.exists(LOGO_PATH):
             icon.setPixmap(make_rounded_logo(LOGO_PATH, 124))
         else:
-            icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 52))
+            icon.setText("✈");
+            icon.setFont(QFont("Segoe UI Emoji", 52))
             icon.setStyleSheet(f"color:{C['accent']};")
+        icon.setFixedSize(104, 104)
+        icon.setScaledContents(True)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lo.addWidget(icon)
-        lo.addSpacing(18)
+        lo.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lo.addSpacing(32)
         t = QLabel("Velo"); t.setFont(QFont("Segoe UI", 27, QFont.Weight.Bold))
         t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
         lo.addWidget(t)
@@ -2463,7 +2487,6 @@ class VeloApp(QMainWindow):
         menu.addAction("🎬  Video", lambda: self._pick_attachment("video"))
         menu.addAction("📎  File", lambda: self._pick_attachment("file"))
         menu.exec(QCursor.pos())
-        menu.exec(QCursor.pos())
 
     def _pick_attachment(self, kind):
         filters = {
@@ -2696,26 +2719,33 @@ class VeloApp(QMainWindow):
 
     def _fill_group_history(self, msgs, gid):
         self._bubbles.clear()
+        prev_sender = None
         for i, m in enumerate(msgs):
             outgoing = m["sender_id"] == self.user["id"]
             content = m["content"]
             if content.startswith("[FILE]"):
                 w = self._parse_attachment(content, outgoing)
                 if w: self.msg_vbox.insertWidget(i, w)
+                prev_sender = None  # une pièce jointe casse le regroupement
             else:
-                sender = None if outgoing else m.get("sender_name", "?")
+                # Regroupement : masque avatar+nom si même expéditeur que le précédent
+                same_as_prev = (m["sender_id"] == prev_sender)
+                sender = None if (outgoing or same_as_prev) else m.get("sender_name", "?")
+                # indent : réserve l'espace avatar pour aligner les messages groupés
+                indent = (not outgoing) and same_as_prev
                 b = self._make_group_bubble(content, outgoing, gid,
                                             msg_id=m.get("id"), edited=m.get("edited", False),
-                                            raw_content=content, sender_name=sender)
+                                            raw_content=content, sender_name=sender, indent=indent)
                 self.msg_vbox.insertWidget(i, b)
+                prev_sender = m["sender_id"]
         self._scroll_bottom()
 
     def _make_group_bubble(self, text, outgoing, gid, msg_id=None, edited=False,
-                           raw_content="", sender_name=None):
+                           raw_content="", sender_name=None, indent=False):
         import datetime
         now = datetime.datetime.now().strftime("%H:%M")
         b = Bubble(text, outgoing, msg_id=msg_id, edited=edited,
-                   sender_name=sender_name, time_str=now)
+                   sender_name=sender_name, time_str=now, indent=indent)
         b._raw_content = raw_content  # contenu sans le préfixe "nom:"
         if msg_id is not None:
             self._bubbles[msg_id] = b
