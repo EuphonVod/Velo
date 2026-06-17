@@ -9,11 +9,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QLineEdit,
     QPushButton, QVBoxLayout, QHBoxLayout, QScrollArea, QTextEdit,
     QFileDialog, QFrame, QSizePolicy, QStackedWidget, QMenu,
-    QGridLayout, QComboBox, QInputDialog, QMessageBox
+    QGridLayout, QComboBox, QInputDialog, QMessageBox, QSlider
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QRect, QThread, QObject,
-    QByteArray, QBuffer, QSize
+    QByteArray, QBuffer, QSize, QPropertyAnimation, QEasingCurve
 )
 from PyQt6.QtGui import (
     QFont, QColor, QPainter, QPen, QPixmap,
@@ -52,6 +52,45 @@ def format_last_seen(iso_str):
     if secs < 86400: return f"last seen {int(secs//3600)} h ago"
     return f"last seen {int(secs//86400)} d ago"
 
+def format_msg_time(dt=None):
+    """Formate l'heure selon la préférence 12h/24h."""
+    if dt is None:
+        dt = datetime.now()
+    if APPEARANCE.get("time_format", "24h") == "12h":
+        return dt.strftime("%I:%M %p").lstrip("0")
+    return dt.strftime("%H:%M")
+
+
+def format_date_label(iso_str):
+    """Renvoie 'Today', 'Yesterday' ou une date pour les séparateurs."""
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", ""))
+    except Exception:
+        return None
+    today = datetime.now().date()
+    d = dt.date()
+    delta = (today - d).days
+    if delta == 0: return "Today"
+    if delta == 1: return "Yesterday"
+    if delta < 7:
+        return dt.strftime("%A")  # nom du jour
+    return dt.strftime("%d %B %Y")
+
+
+def make_date_separator(text):
+    """Petite étiquette de date centrée entre les messages."""
+    wrap = QWidget()
+    wl = QHBoxLayout(wrap); wl.setContentsMargins(0, 10, 0, 10)
+    wl.addStretch()
+    lbl = QLabel(text)
+    lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+    lbl.setStyleSheet(f"""color:{C['text2']};background:{C['card']};
+        border-radius:10px;padding:3px 12px;""")
+    wl.addWidget(lbl)
+    wl.addStretch()
+    return wrap
+
+
 class ApiWorker(QThread):
     done = pyqtSignal(object)
     def __init__(self, fn, *args, **kwargs):
@@ -64,26 +103,99 @@ class ApiWorker(QThread):
             print("Worker error:", ex); result = None
         self.done.emit(result)
 
-# ── Palette ───────────────────────────────────────────────
-C = {
-    "bg":       "#0e1621",
-    "sidebar":  "#17212b",
-    "panel":    "#1c2733",
-    "card":     "#232e3c",
-    "msg_in":   "#182533",
-    "msg_out":  "#2b5278",
-    "hover":    "#202b36",
-    "selected": "#2b5278",
-    "divider":  "#101a24",
-    "accent":   "#5288c1",
-    "accent_h": "#5e93cc",
-    "text":     "#ffffff",
-    "text2":    "#7d8e9e",
-    "text3":    "#5a6b7a",
-    "green":    "#54c75e",
-    "red":      "#e15c5c",
-    "orange":   "#e8a14b",
+# ── Thèmes ────────────────────────────────────────────────
+THEMES = {
+    "standard": {
+        "bg": "#0e1621", "sidebar": "#17212b", "panel": "#1c2733", "card": "#232e3c",
+        "msg_in": "#182533", "msg_out": "#2b5278", "hover": "#202b36", "selected": "#2b5278",
+        "divider": "#101a24", "accent": "#5288c1", "accent_h": "#5e93cc",
+        "text": "#ffffff", "text2": "#7d8e9e", "text3": "#5a6b7a",
+        "green": "#54c75e", "red": "#e15c5c", "orange": "#e8a14b",
+    },
+    "dark": {
+        "bg": "#0b0d10", "sidebar": "#121519", "panel": "#171b20", "card": "#1d2228",
+        "msg_in": "#1a1f25", "msg_out": "#2f4156", "hover": "#1c2127", "selected": "#2f4156",
+        "divider": "#0a0c0e", "accent": "#4a8fd4", "accent_h": "#589ade",
+        "text": "#f2f4f6", "text2": "#828c96", "text3": "#5b636c",
+        "green": "#4fc25a", "red": "#e05a5a", "orange": "#e09a45",
+    },
+    "light": {
+        "bg": "#ffffff", "sidebar": "#f3f5f7", "panel": "#eaedf0", "card": "#e6e9ec",
+        "msg_in": "#eef1f4", "msg_out": "#cfe3fb", "hover": "#e2e6ea", "selected": "#cfe3fb",
+        "divider": "#dde1e5", "accent": "#3d7fc4", "accent_h": "#4a8cd0",
+        "text": "#15191e", "text2": "#5e6b78", "text3": "#9aa3ad",
+        "green": "#2faa42", "red": "#d44545", "orange": "#d88a2e",
+    },
+    "lightgray": {
+        "bg": "#e9ebee", "sidebar": "#dfe2e6", "panel": "#d5d9de", "card": "#cfd4d9",
+        "msg_in": "#d8dce1", "msg_out": "#bcd4f0", "hover": "#d2d6db", "selected": "#bcd4f0",
+        "divider": "#c8ccd1", "accent": "#3d7fc4", "accent_h": "#4a8cd0",
+        "text": "#1a1e23", "text2": "#5a626b", "text3": "#8a929b",
+        "green": "#2faa42", "red": "#d44545", "orange": "#d88a2e",
+    },
 }
+
+
+def _detect_system_language():
+    """Détecte la langue Windows, retombe sur 'en' si non supportée."""
+    supported = {"en", "fr", "de", "es", "ru"}
+    try:
+        import locale
+        # Essaie d'abord getlocale (moderne), puis fallback
+        loc = None
+        try:
+            loc = locale.getlocale()[0]
+        except Exception:
+            pass
+        if not loc:
+            try:
+                loc = locale.getdefaultlocale()[0]
+            except Exception:
+                pass
+        if loc:
+            code = loc.split("_")[0].lower()[:2]
+            if code in supported:
+                return code
+    except Exception:
+        pass
+    return "en"
+
+
+def _load_appearance():
+    """Charge les préférences d'apparence (thème, police, etc.)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "appearance.json")
+    # Au premier lancement, la langue par défaut = langue du système
+    defaults = {"theme": "standard", "font_size": 12, "group_spacing": 2,
+                "animate_gifs": True, "time_format": "24h",
+                "language": _detect_system_language()}
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+                defaults.update(data)
+    except Exception:
+        pass
+    return defaults
+
+
+def _save_appearance(prefs):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "appearance.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(prefs, f)
+    except Exception as e:
+        print("appearance save error:", e)
+
+
+# Préférences chargées au démarrage
+APPEARANCE = _load_appearance()
+
+# Système de traduction (i18n)
+from translations import t as tr, set_language
+set_language(APPEARANCE.get("language", "en"))
+
+# ── Palette (remplie depuis le thème choisi) ──────────────
+C = dict(THEMES.get(APPEARANCE.get("theme", "standard"), THEMES["standard"]))
 
 AVATAR_PALETTE = [
     "#e17076","#7bc862","#65aadd","#ee7aae",
@@ -225,12 +337,34 @@ def make_rounded_logo(path, size, radius_ratio=0.30):
 
 
 class Avatar(QLabel):
-    def __init__(self, name, size=42, image_path="", parent=None):
+    def __init__(self, name, size=42, image_path="", parent=None, online=None):
         super().__init__(parent)
         self.setFixedSize(size, size)
+        self._online = online  # None = pas d'indicateur, True/False = point vert/gris
         self.refresh(name, image_path)
     def refresh(self, name, image_path=""):
-        self.setPixmap(make_avatar(name, self.width(), image_path))
+        base = make_avatar(name, self.width(), image_path)
+        if self._online is not None:
+            # Copie pour ne pas corrompre le pixmap en cache
+            px = base.copy()
+            p = QPainter(px)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            s = self.width()
+            dot = max(10, s // 4)
+            p.setPen(Qt.PenStyle.NoPen)
+            ring = dot + 4
+            p.setBrush(QColor(C["sidebar"]))
+            p.drawEllipse(s - ring, s - ring, ring, ring)
+            p.setBrush(QColor(C["green"] if self._online else C["text3"]))
+            p.drawEllipse(s - ring + 2, s - ring + 2, dot, dot)
+            p.end()
+            self.setPixmap(px)
+        else:
+            self.setPixmap(base)
+    def set_online(self, online):
+        self._online = online
+        # Re-render en gardant le nom/image actuels n'est pas trivial ici,
+        # donc on laisse refresh être rappelé par l'appelant si besoin.
 
 
 # ── Helpers UI ────────────────────────────────────────────
@@ -361,7 +495,7 @@ class Bubble(QWidget):
         # Texte du message
         self.lbl = QLabel(); self.lbl.setWordWrap(True)
         self.lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.lbl.setFont(QFont("Segoe UI", 12))
+        self.lbl.setFont(QFont("Segoe UI", APPEARANCE.get("font_size", 12)))
         self.lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
         self.lbl.setMaximumWidth(510)
         self.lbl.setText(text)
@@ -432,7 +566,11 @@ class FriendRow(QWidget):
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         lo = QHBoxLayout(self); lo.setContentsMargins(10, 7, 10, 7); lo.setSpacing(11)
-        self.av = Avatar(self.uname, 46, user.get("avatar_url", ""))
+        # Détermine le statut en ligne depuis last_seen (si visible)
+        online = None
+        if user.get("show_online", True):
+            online = format_last_seen(user.get("last_seen")) == "online"
+        self.av = Avatar(self.uname, 46, user.get("avatar_url", ""), online=online)
         lo.addWidget(self.av)
         col = QVBoxLayout(); col.setSpacing(2)
         self.name = QLabel(self.uname)
@@ -578,7 +716,7 @@ class ProfileDialog(QDialog):
             rm.clicked.connect(self._remove)
             self.status_box.addWidget(rm)
         elif s == "request_sent":
-            lbl = QLabel("Request sent ✓")
+            lbl = QLabel(tr("request_sent"))
             lbl.setStyleSheet(f"color:{C['text2']};font-size:13px;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.status_box.addWidget(lbl)
@@ -619,7 +757,7 @@ class RequestsDialog(QDialog):
         self._build()
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(20, 20, 20, 20); lo.setSpacing(10)
-        t = QLabel("Friend requests")
+        t = QLabel(tr("friend_requests"))
         t.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
         t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
@@ -635,7 +773,7 @@ class RequestsDialog(QDialog):
             if it.widget(): it.widget().deleteLater()
         reqs = api_get("/friends/requests", self.token) or []
         if not reqs:
-            empty = QLabel("No pending requests.")
+            empty = QLabel(tr("no_pending_requests"))
             empty.setStyleSheet(f"color:{C['text2']};")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.vbox.insertWidget(0, empty)
@@ -703,10 +841,10 @@ class SearchDialog(QDialog):
         self._build()
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(20, 20, 20, 20); lo.setSpacing(12)
-        t = QLabel("Find people")
+        t = QLabel(tr("find_people"))
         t.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
         t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
-        self.inp = QLineEdit(); self.inp.setPlaceholderText("Search by @username")
+        self.inp = QLineEdit(); self.inp.setPlaceholderText(tr("search_by_username"))
         self.inp.setFixedHeight(42); self.inp.setStyleSheet(field())
         self.inp.textChanged.connect(self._on_type); lo.addWidget(self.inp)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
@@ -769,7 +907,7 @@ class SearchDialog(QDialog):
         nm = QLabel("🌐 " + g["name"]);
         nm.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
         nm.setStyleSheet(f"color:{C['text']};background:transparent;")
-        sub = QLabel("Public group");
+        sub = QLabel(tr("public_group"));
         sub.setFont(QFont("Segoe UI", 10))
         sub.setStyleSheet(f"color:{C['text2']};background:transparent;")
         col.addWidget(nm);
@@ -816,15 +954,15 @@ class LoginDialog(QDialog):
         t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
         lo.addWidget(t)
         lo.addSpacing(4)
-        sub = QLabel("Fast and secure messaging"); sub.setFont(QFont("Segoe UI", 12))
+        sub = QLabel(tr("login_subtitle")); sub.setFont(QFont("Segoe UI", 12))
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(sub)
         lo.addSpacing(30)
         self.email = QLineEdit()
-        self.email.setPlaceholderText("Email or username")
+        self.email.setPlaceholderText(tr("email_or_username"))
         self.email.setFixedHeight(46); self.email.setStyleSheet(field(12)); lo.addWidget(self.email)
         lo.addSpacing(10)
-        self.pw = QLineEdit(); self.pw.setPlaceholderText("Password")
+        self.pw = QLineEdit(); self.pw.setPlaceholderText(tr("password"))
         self.pw.setEchoMode(QLineEdit.EchoMode.Password)
         self.pw.setFixedHeight(46); self.pw.setStyleSheet(field(12))
         self.pw.returnPressed.connect(self._login); lo.addWidget(self.pw)
@@ -833,10 +971,10 @@ class LoginDialog(QDialog):
         self.err.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.err.setStyleSheet(f"color:{C['red']};"); lo.addWidget(self.err)
         lo.addSpacing(6)
-        lb = btn("Log in", C["accent"], bold=True, font_size=14)
+        lb = btn(tr("log_in"), C["accent"], bold=True, font_size=14)
         lb.setFixedHeight(48); lb.clicked.connect(self._login); lo.addWidget(lb)
         lo.addSpacing(10)
-        rb = QPushButton("Create account"); rb.setFixedHeight(46)
+        rb = QPushButton(tr("create_account")); rb.setFixedHeight(46)
         rb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         rb.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['accent']};
             border:1.5px solid {C['accent']};border-radius:10px;font-size:13px;
@@ -862,15 +1000,15 @@ class LoginDialog(QDialog):
 class RegisterDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Create account")
+        self.setWindowTitle(tr("create_account"))
         self.setFixedSize(380, 410)
         self.setStyleSheet(f"background:{C['bg']};")
         lo = QVBoxLayout(self); lo.setContentsMargins(36, 36, 36, 36); lo.setSpacing(10)
-        t = QLabel("Create account"); t.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
+        t = QLabel(tr("create_account")); t.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
         t.setStyleSheet(f"color:{C['text']};margin-bottom:10px;"); lo.addWidget(t)
-        self.un = QLineEdit(); self.un.setPlaceholderText("Username")
-        self.em = QLineEdit(); self.em.setPlaceholderText("Email")
-        self.pw = QLineEdit(); self.pw.setPlaceholderText("Password")
+        self.un = QLineEdit(); self.un.setPlaceholderText(tr("username"))
+        self.em = QLineEdit(); self.em.setPlaceholderText(tr("email_or_username"))
+        self.pw = QLineEdit(); self.pw.setPlaceholderText(tr("password"))
         self.pw.setEchoMode(QLineEdit.EchoMode.Password)
         for w in (self.un, self.em, self.pw):
             w.setFixedHeight(44); w.setStyleSheet(field(10)); lo.addWidget(w)
@@ -906,21 +1044,21 @@ class CreateGroupDialog(QDialog):
         self._build()
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(32, 28, 32, 28); lo.setSpacing(12)
-        t = QLabel("Create a group")
+        t = QLabel(tr("create_a_group"))
         t.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
         t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
-        self.name = QLineEdit(); self.name.setPlaceholderText("Group name")
+        self.name = QLineEdit(); self.name.setPlaceholderText(tr("group_name"))
         self.name.setFixedHeight(44); self.name.setStyleSheet(field()); lo.addWidget(self.name)
-        self.bio = QLineEdit(); self.bio.setPlaceholderText("Description (optional)")
+        self.bio = QLineEdit(); self.bio.setPlaceholderText(tr("description_optional"))
         self.bio.setFixedHeight(44); self.bio.setStyleSheet(field()); lo.addWidget(self.bio)
         # Toggle privé
         row = QWidget()
         rl = QHBoxLayout(row); rl.setContentsMargins(0, 4, 0, 4)
         col = QVBoxLayout(); col.setSpacing(1)
-        lab = QLabel("Private group")
+        lab = QLabel(tr("private_group"))
         lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
         lab.setStyleSheet(f"color:{C['text']};")
-        desc = QLabel("Members need an invitation to join")
+        desc = QLabel(tr("private_desc"))
         desc.setFont(QFont("Segoe UI", 10)); desc.setStyleSheet(f"color:{C['text2']};")
         col.addWidget(lab); col.addWidget(desc)
         rl.addLayout(col); rl.addStretch()
@@ -971,7 +1109,10 @@ class GroupRow(QWidget):
         self.preview.setStyleSheet(f"color:{C['text2']};background:transparent;")
         col.addWidget(self.name); col.addWidget(self.preview)
         lo.addLayout(col); lo.addStretch()
+        self._default_preview = f"{lock}Group"
         self._upd()
+    def set_preview(self, t):
+        self.preview.setText(t[:38] + ("…" if len(t) > 38 else ""))
     def set_selected(self, v): self._sel = v; self._upd()
     def _upd(self):
         self.setStyleSheet(f"background:{C['selected'] if self._sel else 'transparent'};border-radius:10px;")
@@ -1004,7 +1145,7 @@ class InviteFriendDialog(QDialog):
         self._build()
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(20, 20, 20, 20); lo.setSpacing(10)
-        t = QLabel("Invite a friend")
+        t = QLabel(tr("invite_a_friend"))
         t.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
@@ -1114,7 +1255,7 @@ class GroupProfileDialog(QDialog):
         lo.addWidget(bio)
         sep = QFrame(); sep.setFixedHeight(1)
         sep.setStyleSheet(f"background:{C['divider']};border:none;"); lo.addWidget(sep)
-        mt = QLabel("MEMBERS")
+        mt = QLabel(tr("members"))
         mt.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         mt.setStyleSheet(f"color:{C['text3']};padding:10px 24px 4px 24px;letter-spacing:1px;")
         lo.addWidget(mt)
@@ -1280,7 +1421,7 @@ class ImageBubble(QWidget):
         super().__init__(parent)
         self.url = url; self.token = token
         lo = QHBoxLayout(self); lo.setContentsMargins(16, 3, 16, 3)
-        self.lbl = QLabel("Loading image…")
+        self.lbl = QLabel(tr("loading_image"))
         self.lbl.setStyleSheet(f"color:{C['text2']};background:{C['msg_out' if outgoing else 'msg_in']};"
                                f"border-radius:12px;padding:20px;")
         self.lbl.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1354,7 +1495,7 @@ class FileBubble(QWidget):
         nm = QLabel(name if len(name) < 24 else name[:21]+"…")
         nm.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
         nm.setStyleSheet(f"color:{C['text']};background:transparent;")
-        sub = QLabel("Click to download"); sub.setFont(QFont("Segoe UI", 9))
+        sub = QLabel(tr("click_download")); sub.setFont(QFont("Segoe UI", 9))
         sub.setStyleSheet(f"color:{C['text2']};background:transparent;")
         col.addWidget(nm); col.addWidget(sub); cl.addLayout(col); cl.addStretch()
         card.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1424,7 +1565,7 @@ class ConvSettingsDialog(QDialog):
         self._build(other_name)
     def _build(self, other_name):
         lo = QVBoxLayout(self); lo.setContentsMargins(28, 24, 28, 24); lo.setSpacing(14)
-        t = QLabel("Conversation settings")
+        t = QLabel(tr("conversation_settings"))
         t.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
         sub = QLabel(f"with {other_name}")
@@ -1434,10 +1575,10 @@ class ConvSettingsDialog(QDialog):
         row = QWidget()
         rl = QHBoxLayout(row); rl.setContentsMargins(0, 8, 0, 0)
         col = QVBoxLayout(); col.setSpacing(2)
-        lab = QLabel("Delete after reading")
+        lab = QLabel(tr("delete_after_reading"))
         lab.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
         lab.setStyleSheet(f"color:{C['text']};")
-        desc = QLabel("Messages vanish when you close the chat")
+        desc = QLabel(tr("vanish_desc"))
         desc.setFont(QFont("Segoe UI", 10))
         desc.setStyleSheet(f"color:{C['text2']};")
         col.addWidget(lab); col.addWidget(desc)
@@ -1480,15 +1621,23 @@ class EmojiPicker(QDialog):
     ]
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Emojis")
-        self.setFixedSize(360, 320)
-        self.setStyleSheet(f"background:{C['bg']};")
+        self.setWindowFlags(Qt.WindowType.Popup)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(360, 300)
         self._build()
+
+    def paintEvent(self, e):
+        # Dessine un fond arrondi anti-aliasé (coins lisses)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C["card"]))
+        from PyQt6.QtCore import QRectF
+        p.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 18, 18)
+        p.end()
+
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(12, 12, 12, 12); lo.setSpacing(8)
-        t = QLabel("Pick an emoji")
-        t.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-        t.setStyleSheet(f"color:{C['text']};"); lo.addWidget(t)
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border:none;background:transparent;")
         grid_w = QWidget(); grid_w.setStyleSheet("background:transparent;")
@@ -1506,30 +1655,41 @@ class EmojiPicker(QDialog):
         scroll.setWidget(grid_w); lo.addWidget(scroll)
     def _pick(self, emo):
         self.emoji_picked.emit(emo)
+        self.close()
 
 class GifPicker(QDialog):
     gif_picked = pyqtSignal(str)  # émet l'URL du GIF choisi
     def __init__(self, token, parent=None):
         super().__init__(parent)
         self.token = token
-        self.setWindowTitle("GIFs")
-        self.setFixedSize(440, 520)
-        self.setStyleSheet(f"background:{C['bg']};")
+        self.setWindowFlags(Qt.WindowType.Popup)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setFixedSize(440, 480)
         self._workers = []
         self._build()
         self._search("")  # trending au départ
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C["card"]))
+        from PyQt6.QtCore import QRectF
+        p.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 18, 18)
+        p.end()
+
     def _build(self):
         lo = QVBoxLayout(self); lo.setContentsMargins(16, 16, 16, 16); lo.setSpacing(10)
         # Barre de recherche + onglet favoris
         top = QHBoxLayout()
-        self.inp = QLineEdit(); self.inp.setPlaceholderText("Search GIFs…")
+        self.inp = QLineEdit(); self.inp.setPlaceholderText(tr("search_gifs"))
         self.inp.setFixedHeight(40); self.inp.setStyleSheet(field())
         self.inp.textChanged.connect(self._on_type)
         top.addWidget(self.inp)
         self.fav_btn = QPushButton("⭐")
         self.fav_btn.setFixedSize(40, 40)
         self.fav_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.fav_btn.setStyleSheet(f"""QPushButton{{background:{C['card']};border:none;
+        self.fav_btn.setStyleSheet(f"""QPushButton{{background:{C['panel']};border:none;
             border-radius:10px;font-size:18px;}}
             QPushButton:hover{{background:{C['hover']};}}""")
         self.fav_btn.clicked.connect(self._show_favorites)
@@ -1552,7 +1712,7 @@ class GifPicker(QDialog):
             if it.widget(): it.widget().deleteLater()
     def _search(self, query):
         self._clear_grid()
-        loading = QLabel("Loading…"); loading.setStyleSheet(f"color:{C['text2']};")
+        loading = QLabel(tr("loading")); loading.setStyleSheet(f"color:{C['text2']};")
         self.grid.addWidget(loading, 0, 0)
         w = ApiWorker(klipy_search, query)
         w.done.connect(self._show_results)
@@ -1561,7 +1721,7 @@ class GifPicker(QDialog):
     def _show_results(self, results):
         self._clear_grid()
         if not results:
-            empty = QLabel("No GIFs found."); empty.setStyleSheet(f"color:{C['text2']};")
+            empty = QLabel(tr("no_gifs")); empty.setStyleSheet(f"color:{C['text2']};")
             self.grid.addWidget(empty, 0, 0); return
         cols = 2
         for i, g in enumerate(results):
@@ -1579,12 +1739,12 @@ class GifPicker(QDialog):
         return cell
     def _pick(self, url):
         self.gif_picked.emit(url)
-        self.accept()
+        self.close()
     def _show_favorites(self):
         favs = self._load_favs()
         self._clear_grid()
         if not favs:
-            empty = QLabel("No favorites yet. Long-press a GIF to add.")
+            empty = QLabel(tr("no_favorites"))
             empty.setStyleSheet(f"color:{C['text2']};"); empty.setWordWrap(True)
             self.grid.addWidget(empty, 0, 0); return
         cols = 2
@@ -1645,7 +1805,11 @@ class AnimatedGif(QLabel):
             self._movie.setScaledSize(scaled_size)
             self.setFixedSize(scaled_size)
         self.setMovie(self._movie)
-        self._movie.start()
+        if APPEARANCE.get("animate_gifs", True):
+            self._movie.start()
+        else:
+            # GIF figé sur la première image
+            self._movie.jumpToFrame(0)
 
 
 class GifDownloader(QThread):
@@ -1823,7 +1987,7 @@ class SettingsPage(QWidget):
 
         # Top bar
         topbar = QWidget(); topbar.setFixedHeight(58)
-        topbar.setStyleSheet(f"background:{C['sidebar']};border-bottom:1px solid {C['divider']};")
+        topbar.setStyleSheet(f"background:{C['sidebar']};")
         tl = QHBoxLayout(topbar); tl.setContentsMargins(12, 0, 16, 0); tl.setSpacing(10)
         back = QPushButton("←"); back.setFixedSize(36, 36)
         back.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -1832,7 +1996,7 @@ class SettingsPage(QWidget):
             border:none;border-radius:18px;}}
             QPushButton:hover{{background:{C['hover']};}}""")
         back.clicked.connect(self.closed.emit)
-        title = QLabel("Settings")
+        title = QLabel(tr("settings"))
         title.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
         title.setStyleSheet(f"color:{C['text']};")
         tl.addWidget(back); tl.addWidget(title); tl.addStretch()
@@ -1855,12 +2019,13 @@ class SettingsPage(QWidget):
 
         # Build category pages
         categories = [
-            ("Account", "👤", self._page_account),
-            ("Privacy", "🔒", self._page_privacy),
-            ("Notifications", "🔔", self._page_notifications),
-            ("Voice & Video", "🎙", self._page_voice),
-            ("Appearance", "🎨", self._page_appearance),
-            ("About", "ℹ", self._page_about),
+            (tr("account"), "👤", self._page_account),
+            (tr("privacy"), "🔒", self._page_privacy),
+            (tr("notifications"), "🔔", self._page_notifications),
+            (tr("voice_video"), "🎙", self._page_voice),
+            (tr("appearance"), "🎨", self._page_appearance),
+            (tr("language_time"), "🌐", self._page_language_time),
+            (tr("about"), "ℹ", self._page_about),
         ]
         for i, (name, icon, builder) in enumerate(categories):
             page = builder()
@@ -1877,7 +2042,7 @@ class SettingsPage(QWidget):
 
         cs.addStretch()
         # Logout at the bottom of the sidebar
-        logout = QPushButton("  ⏻   Log out")
+        logout = QPushButton(f"  ⏻   {tr('log_out')}")
         logout.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         logout.setFixedHeight(40)
         logout.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['red']};
@@ -1925,21 +2090,21 @@ class SettingsPage(QWidget):
     # ── Page: Account ─────────────────────────────────────
     def _page_account(self):
         page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
-        lo.addWidget(self._page_title("My Account"))
+        lo.addWidget(self._page_title(tr("my_account")))
 
         # Avatar
         self.av_w = Avatar(self.user.get("username", "?"), 92, self.user.get("avatar_url", ""))
         self.av_w.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.av_w.mousePressEvent = lambda e: self._pick()
-        ch = QLabel("Tap to change"); ch.setFont(QFont("Segoe UI", 10))
+        ch = QLabel(tr("tap_to_change")); ch.setFont(QFont("Segoe UI", 10))
         ch.setStyleSheet(f"color:{C['text2']};")
         lo.addWidget(self.av_w, alignment=Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(ch, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        lo.addWidget(self._small_label("Username"))
+        lo.addWidget(self._small_label(tr("username")))
         self.un = QLineEdit(self.user.get("username", "")); self.un.setFixedHeight(44)
         self.un.setStyleSheet(field()); lo.addWidget(self.un)
-        lo.addWidget(self._small_label("Bio"))
+        lo.addWidget(self._small_label(tr("bio")))
         self.bio = QTextEdit(); self.bio.setFixedHeight(80)
         self.bio.setPlainText(self.user.get("bio", "")); self.bio.setStyleSheet(field())
         lo.addWidget(self.bio)
@@ -1947,47 +2112,47 @@ class SettingsPage(QWidget):
         self.acc_status = QLabel(""); self.acc_status.setFont(QFont("Segoe UI", 11))
         self.acc_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lo.addWidget(self.acc_status)
-        save = btn("Save profile", C["accent"], bold=True, font_size=13)
+        save = btn(tr("save_profile"), C["accent"], bold=True, font_size=13)
         save.setFixedHeight(46); save.clicked.connect(self._save_profile); lo.addWidget(save)
 
         # Email
         sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f"background:{C['divider']};border:none;")
         lo.addSpacing(6); lo.addWidget(sep); lo.addSpacing(6)
-        lo.addWidget(self._section_label("EMAIL"))
-        self.new_email = QLineEdit(); self.new_email.setPlaceholderText("New email")
+        lo.addWidget(self._section_label(tr("email")))
+        self.new_email = QLineEdit(); self.new_email.setPlaceholderText(tr("new_email"))
         self.new_email.setFixedHeight(42); self.new_email.setStyleSheet(field()); lo.addWidget(self.new_email)
-        self.email_pw = QLineEdit(); self.email_pw.setPlaceholderText("Current password")
+        self.email_pw = QLineEdit(); self.email_pw.setPlaceholderText(tr("current_password"))
         self.email_pw.setEchoMode(QLineEdit.EchoMode.Password)
         self.email_pw.setFixedHeight(42); self.email_pw.setStyleSheet(field()); lo.addWidget(self.email_pw)
         self.email_status = QLabel(""); self.email_status.setFont(QFont("Segoe UI", 10))
         self.email_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.email_status)
-        eb = btn("Change email", C["card"], C["text"], font_size=12)
+        eb = btn(tr("change_email"), C["card"], C["text"], font_size=12)
         eb.setFixedHeight(42); eb.clicked.connect(self._change_email); lo.addWidget(eb)
 
         # Password
         sep2 = QFrame(); sep2.setFixedHeight(1); sep2.setStyleSheet(f"background:{C['divider']};border:none;")
         lo.addSpacing(6); lo.addWidget(sep2); lo.addSpacing(6)
-        lo.addWidget(self._section_label("PASSWORD"))
-        self.cur_pw = QLineEdit(); self.cur_pw.setPlaceholderText("Current password")
+        lo.addWidget(self._section_label(tr("password_caps")))
+        self.cur_pw = QLineEdit(); self.cur_pw.setPlaceholderText(tr("current_password"))
         self.cur_pw.setEchoMode(QLineEdit.EchoMode.Password)
         self.cur_pw.setFixedHeight(42); self.cur_pw.setStyleSheet(field()); lo.addWidget(self.cur_pw)
-        self.new_pw = QLineEdit(); self.new_pw.setPlaceholderText("New password")
+        self.new_pw = QLineEdit(); self.new_pw.setPlaceholderText(tr("new_password"))
         self.new_pw.setEchoMode(QLineEdit.EchoMode.Password)
         self.new_pw.setFixedHeight(42); self.new_pw.setStyleSheet(field()); lo.addWidget(self.new_pw)
         self.pw_status = QLabel(""); self.pw_status.setFont(QFont("Segoe UI", 10))
         self.pw_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.pw_status)
-        pb = btn("Change password", C["card"], C["text"], font_size=12)
+        pb = btn(tr("change_password"), C["card"], C["text"], font_size=12)
         pb.setFixedHeight(42); pb.clicked.connect(self._change_password); lo.addWidget(pb)
 
         # Danger zone
         sep3 = QFrame(); sep3.setFixedHeight(1); sep3.setStyleSheet(f"background:{C['divider']};border:none;")
         lo.addSpacing(6); lo.addWidget(sep3); lo.addSpacing(6)
-        dz = QLabel("DANGER ZONE")
+        dz = QLabel(tr("danger_zone"))
         dz.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         dz.setStyleSheet(f"color:{C['red']};letter-spacing:1px;")
         lo.addWidget(dz)
         # Supprimer tous ses messages
-        nuke_btn = QPushButton("Delete all my messages")
+        nuke_btn = QPushButton(tr("delete_all_messages"))
         nuke_btn.setFixedHeight(44)
         nuke_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         nuke_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['orange']};
@@ -1997,7 +2162,7 @@ class SettingsPage(QWidget):
         nuke_btn.clicked.connect(self._nuke_messages)
         lo.addWidget(nuke_btn)
         # Supprimer le compte
-        del_btn = QPushButton("Delete my account")
+        del_btn = QPushButton(tr("delete_account"))
         del_btn.setFixedHeight(44)
         del_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         del_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['red']};
@@ -2011,27 +2176,27 @@ class SettingsPage(QWidget):
     # ── Page: Privacy ─────────────────────────────────────
     def _page_privacy(self):
         page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
-        lo.addWidget(self._page_title("Privacy"))
+        lo.addWidget(self._page_title(tr("privacy")))
         priv_row, self.priv_toggle = self._toggle_row(
-            "Private profile", "Only friends can see your bio and message you",
+            tr("private_profile"), tr("private_profile_desc"),
             self.user.get("is_private", False))
         lo.addWidget(priv_row)
         online_row, self.online_toggle = self._toggle_row(
-            "Show online status", "Others can see when you're online",
+            tr("show_online"), tr("show_online_desc"),
             self.user.get("show_online", True))
         lo.addWidget(online_row)
         self.priv_status = QLabel(""); self.priv_status.setFont(QFont("Segoe UI", 11))
         self.priv_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.priv_status)
-        save = btn("Save privacy", C["accent"], bold=True, font_size=13)
+        save = btn(tr("save_privacy"), C["accent"], bold=True, font_size=13)
         save.setFixedHeight(46); save.clicked.connect(self._save_privacy); lo.addWidget(save)
         return page
 
     # ── Page: Notifications ───────────────────────────────
     def _page_notifications(self):
         page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
-        lo.addWidget(self._page_title("Notifications"))
+        lo.addWidget(self._page_title(tr("notifications")))
         notif_row, self.notif_toggle = self._toggle_row(
-            "Enable notifications", "Sound and desktop alerts for new messages",
+            tr("enable_notifications"), tr("enable_notifications_desc"),
             getattr(self.app, "notifications_on", True) if self.app else True)
         lo.addWidget(notif_row)
         self.notif_toggle.toggled.connect(self.notif_changed.emit)
@@ -2040,14 +2205,14 @@ class SettingsPage(QWidget):
     # ── Page: Voice & Video ───────────────────────────────
     def _page_voice(self):
         page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
-        lo.addWidget(self._page_title("Voice & Video"))
+        lo.addWidget(self._page_title(tr("voice_video")))
         inputs, outputs = list_audio_devices()
-        lo.addWidget(self._small_label("🎤 Microphone"))
+        lo.addWidget(self._small_label(tr("microphone")))
         self.mic_combo = QComboBox(); self.mic_combo.setStyleSheet(self._combo_style())
         for idx, name in inputs:
             self.mic_combo.addItem(name, idx)
         lo.addWidget(self.mic_combo)
-        lo.addWidget(self._small_label("🔊 Speaker"))
+        lo.addWidget(self._small_label(tr("speaker")))
         self.spk_combo = QComboBox(); self.spk_combo.setStyleSheet(self._combo_style())
         for idx, name in outputs:
             self.spk_combo.addItem(name, idx)
@@ -2061,24 +2226,164 @@ class SettingsPage(QWidget):
             if i >= 0: self.spk_combo.setCurrentIndex(i)
         self.voice_status = QLabel(""); self.voice_status.setFont(QFont("Segoe UI", 11))
         self.voice_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.voice_status)
-        save = btn("Save audio devices", C["accent"], bold=True, font_size=13)
+        save = btn(tr("save_audio"), C["accent"], bold=True, font_size=13)
         save.setFixedHeight(46); save.clicked.connect(self._save_voice); lo.addWidget(save)
         return page
 
     # ── Page: Appearance ──────────────────────────────────
     def _page_appearance(self):
-        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
-        lo.addWidget(self._page_title("Appearance"))
-        info = QLabel("Theme customization is coming soon.\nVelo currently uses a dark theme.")
-        info.setWordWrap(True)
-        info.setStyleSheet(f"color:{C['text2']};font-size:12px;font-family:'Segoe UI';")
-        lo.addWidget(info)
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(14)
+        lo.addWidget(self._page_title(tr("appearance")))
+        prefs = _load_appearance()
+
+        # Thème
+        lo.addWidget(self._section_label(tr("theme")))
+        self.theme_combo = QComboBox(); self.theme_combo.setStyleSheet(self._combo_style())
+        theme_names = [("standard", "Standard (blue)"), ("dark", "Dark"),
+                       ("light", "Light"), ("lightgray", "Light gray")]
+        for key, label in theme_names:
+            self.theme_combo.addItem(label, key)
+        i = self.theme_combo.findData(prefs.get("theme", "standard"))
+        if i >= 0: self.theme_combo.setCurrentIndex(i)
+        lo.addWidget(self.theme_combo)
+        hint = QLabel(tr("theme_hint"))
+        hint.setStyleSheet(f"color:{C['text3']};font-size:10px;font-family:'Segoe UI';")
+        lo.addWidget(hint)
+
+        # Taille du texte
+        sep1 = QFrame(); sep1.setFixedHeight(1); sep1.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(4); lo.addWidget(sep1); lo.addSpacing(4)
+        self.fontsize_label = QLabel(tr("text_size", v=prefs.get('font_size', 12)))
+        self.fontsize_label.setStyleSheet(f"color:{C['text']};font-size:12px;font-weight:600;font-family:'Segoe UI';")
+        lo.addWidget(self.fontsize_label)
+        self.fontsize_slider = QSlider(Qt.Orientation.Horizontal)
+        self.fontsize_slider.setMinimum(9); self.fontsize_slider.setMaximum(20)
+        self.fontsize_slider.setValue(prefs.get("font_size", 12))
+        self.fontsize_slider.setFixedHeight(24)
+        self.fontsize_slider.setStyleSheet(self._slider_style())
+        self.fontsize_slider.valueChanged.connect(
+            lambda v: self.fontsize_label.setText(tr("text_size", v=v)))
+        lo.addWidget(self.fontsize_slider)
+
+        # Espace entre messages
+        self.spacing_label = QLabel(tr("space_messages", v=prefs.get('group_spacing', 2)))
+        self.spacing_label.setStyleSheet(f"color:{C['text']};font-size:12px;font-weight:600;font-family:'Segoe UI';")
+        lo.addWidget(self.spacing_label)
+        self.spacing_slider = QSlider(Qt.Orientation.Horizontal)
+        self.spacing_slider.setMinimum(0); self.spacing_slider.setMaximum(16)
+        self.spacing_slider.setValue(prefs.get("group_spacing", 2))
+        self.spacing_slider.setFixedHeight(24)
+        self.spacing_slider.setStyleSheet(self._slider_style())
+        self.spacing_slider.valueChanged.connect(
+            lambda v: self.spacing_label.setText(tr("space_messages", v=v)))
+        lo.addWidget(self.spacing_slider)
+
+        # Animer les GIFs
+        sep3 = QFrame(); sep3.setFixedHeight(1); sep3.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(4); lo.addWidget(sep3); lo.addSpacing(4)
+        gif_row, self.gif_toggle = self._toggle_row(
+            tr("animate_gifs"), tr("animate_gifs_desc"),
+            prefs.get("animate_gifs", True))
+        lo.addWidget(gif_row)
+
+        # Bouton sauvegarder
+        self.appearance_status = QLabel(""); self.appearance_status.setFont(QFont("Segoe UI", 11))
+        self.appearance_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(self.appearance_status)
+        save = btn(tr("save_appearance"), C["accent"], bold=True, font_size=13)
+        save.setFixedHeight(46); save.clicked.connect(self._save_appearance_prefs)
+        lo.addWidget(save)
         return page
+
+    # ── Page: Language & Time ─────────────────────────────
+    def _page_language_time(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(14)
+        lo.addWidget(self._page_title(tr("language_time")))
+        prefs = _load_appearance()
+
+        # Langue
+        lo.addWidget(self._section_label(tr("language")))
+        self.lang_combo = QComboBox(); self.lang_combo.setStyleSheet(self._combo_style())
+        languages = [("en", "English"), ("fr", "Français"), ("de", "Deutsch"),
+                     ("es", "Español"), ("ru", "Русский")]
+        for key, label in languages:
+            self.lang_combo.addItem(label, key)
+        li = self.lang_combo.findData(prefs.get("language", "en"))
+        if li >= 0: self.lang_combo.setCurrentIndex(li)
+        lo.addWidget(self.lang_combo)
+
+        # Format de l'heure
+        sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f"background:{C['divider']};border:none;")
+        lo.addSpacing(4); lo.addWidget(sep); lo.addSpacing(4)
+        lo.addWidget(self._section_label(tr("time_format")))
+        self.time_combo = QComboBox(); self.time_combo.setStyleSheet(self._combo_style())
+        self.time_combo.addItem(tr("time_24h"), "24h")
+        self.time_combo.addItem(tr("time_12h"), "12h")
+        ti = self.time_combo.findData(prefs.get("time_format", "24h"))
+        if ti >= 0: self.time_combo.setCurrentIndex(ti)
+        lo.addWidget(self.time_combo)
+
+        # Bouton sauvegarder
+        self.langtime_status = QLabel(""); self.langtime_status.setFont(QFont("Segoe UI", 11))
+        self.langtime_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(self.langtime_status)
+        save = btn(tr("save"), C["accent"], bold=True, font_size=13)
+        save.setFixedHeight(46); save.clicked.connect(self._save_langtime_prefs)
+        lo.addWidget(save)
+        return page
+
+    def _save_langtime_prefs(self):
+        prefs = _load_appearance()
+        prefs["language"] = self.lang_combo.currentData()
+        prefs["time_format"] = self.time_combo.currentData()
+        _save_appearance(prefs)
+        global APPEARANCE
+        APPEARANCE = prefs
+        self.langtime_status.setStyleSheet(f"color:{C['green']};")
+        self.langtime_status.setText(tr("saved_restarting"))
+        QTimer.singleShot(500, self._restart_app)
+
+    def _slider_style(self):
+        return f"""
+            QSlider {{min-height:22px;}}
+            QSlider::groove:horizontal {{height:6px;background:{C['panel']};border-radius:3px;margin:0px;}}
+            QSlider::handle:horizontal {{background:{C['accent']};width:16px;height:16px;
+                margin:-6px 0;border-radius:8px;}}
+            QSlider::handle:horizontal:hover {{background:{C['accent_h']};}}
+            QSlider::sub-page:horizontal {{background:{C['accent']};border-radius:3px;}}
+        """
+
+    def _save_appearance_prefs(self):
+        prefs = _load_appearance()
+        prefs["theme"] = self.theme_combo.currentData()
+        prefs["font_size"] = self.fontsize_slider.value()
+        prefs["group_spacing"] = self.spacing_slider.value()
+        prefs["animate_gifs"] = self.gif_toggle.isChecked()
+        _save_appearance(prefs)
+        global APPEARANCE
+        APPEARANCE = prefs
+        self.appearance_status.setStyleSheet(f"color:{C['green']};")
+        self.appearance_status.setText(tr("saved_restarting"))
+        # Redémarre l'app automatiquement pour appliquer le thème
+        QTimer.singleShot(500, self._restart_app)
+
+    def _restart_app(self):
+        import sys
+        # Ferme proprement les connexions de l'app principale
+        try:
+            if self.app:
+                if getattr(self.app, "ws", None): self.app.ws.close()
+                if getattr(self.app, "group_ws", None): self.app.group_ws.close()
+        except Exception:
+            pass
+        # Relance le process Python avec les mêmes arguments
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
 
     # ── Page: About ───────────────────────────────────────
     def _page_about(self):
         page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
-        lo.addWidget(self._page_title("About Velo"))
+        lo.addWidget(self._page_title(tr("about")))
         if os.path.exists(LOGO_PATH):
             logo = QLabel(); logo.setPixmap(make_rounded_logo(LOGO_PATH, 80))
             logo.setFixedSize(80, 80); logo.setScaledContents(True)
@@ -2243,6 +2548,56 @@ class SettingsPage(QWidget):
 
 
 # ── Main window ───────────────────────────────────────────
+class SplashScreen(QWidget):
+    """Écran de chargement façon Discord pendant le démarrage de l'app."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setFixedSize(360, 360)
+        self.setStyleSheet(f"background:{C['bg']};")
+        lo = QVBoxLayout(self)
+        lo.setContentsMargins(40, 40, 40, 40); lo.setSpacing(0)
+        lo.addStretch()
+        icon = QLabel()
+        if os.path.exists(LOGO_PATH):
+            icon.setPixmap(make_rounded_logo(LOGO_PATH, 120))
+            icon.setFixedSize(120, 120); icon.setScaledContents(True)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lo.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
+        lo.addSpacing(28)
+        name = QLabel("Velo")
+        name.setFont(QFont("Segoe UI", 24, QFont.Weight.Bold))
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name.setStyleSheet(f"color:{C['text']};")
+        lo.addWidget(name)
+        lo.addSpacing(8)
+        self.status = QLabel(tr("connecting"))
+        self.status.setFont(QFont("Segoe UI", 12))
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setStyleSheet(f"color:{C['text2']};")
+        lo.addWidget(self.status)
+        lo.addStretch()
+        self._dots = 0
+        self._dot_timer = QTimer(self)
+        self._dot_timer.timeout.connect(self._tick)
+        self._dot_timer.start(400)
+        screen = QApplication.primaryScreen().geometry()
+        self.move((screen.width() - self.width()) // 2,
+                  (screen.height() - self.height()) // 2)
+
+    def _tick(self):
+        self._dots = (self._dots + 1) % 4
+        self.status.setText("Connecting" + "." * self._dots)
+
+    def set_status(self, text):
+        self.status.setText(text)
+
+    def stop(self):
+        self._dot_timer.stop()
+        self.close()
+
+
 class VeloApp(QMainWindow):
     sig_msg = pyqtSignal(str, int)
     sig_group_msg = pyqtSignal(str)
@@ -2253,10 +2608,12 @@ class VeloApp(QMainWindow):
     sig_call_unavailable = pyqtSignal()
     sig_msg_edited = pyqtSignal(int, str)    # (message_id, new_text)
     sig_msg_deleted = pyqtSignal(int)        # (message_id)
-    def __init__(self, token, user):
+    def __init__(self, token, user, splash=None):
         super().__init__()
         self.token = token
         self.user = user
+        self._splash = splash
+        self._loaded_flags = {"friends": False, "groups": False}
         self.recv_id = None
         self.friends = {}
         self.groups = {}
@@ -2300,6 +2657,9 @@ class VeloApp(QMainWindow):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._periodic_refresh)
         self.refresh_timer.start(10000)
+        # Sécurité : ferme le splash après 8s max même si le réseau traîne
+        if self._splash is not None:
+            QTimer.singleShot(8000, self._force_close_splash)
         self._typing_timer = QTimer(self)
         self._typing_timer.setSingleShot(True)
         self._typing_timer.timeout.connect(self._stop_typing)
@@ -2425,7 +2785,9 @@ class VeloApp(QMainWindow):
             return
         d = GifPicker(self.token, self)
         d.gif_picked.connect(self._send_gif)
-        d.exec()
+        anchor = self.inp.mapToGlobal(self.inp.rect().bottomRight())
+        d.move(anchor.x() - d.width() + 40, anchor.y() - d.height() - 50)
+        d.show()
 
     def _send_gif(self, url):
         # On envoie le GIF comme une pièce jointe de type image
@@ -2449,7 +2811,10 @@ class VeloApp(QMainWindow):
     def _open_emoji(self):
         d = EmojiPicker(self)
         d.emoji_picked.connect(self._insert_emoji)
-        d.exec()
+        # Ancre le panneau en bas à droite de la zone de saisie (sort vers le haut)
+        anchor = self.inp.mapToGlobal(self.inp.rect().bottomRight())
+        d.move(anchor.x() - d.width() + 40, anchor.y() - d.height() - 50)
+        d.show()
 
     def _insert_emoji(self, emo):
         # Insère l'emoji à la position du curseur dans le champ
@@ -2626,14 +2991,14 @@ class VeloApp(QMainWindow):
         if self.user["id"] not in my_ids:
             # On a été kické/banni
             self.current_group_id = None
-            self.ch_name.setText("Select a chat")
+            self.ch_name.setText(tr("select_a_chat"))
             self.ch_sub.setText("")
             self.view_prof.setVisible(False)
             while self.msg_vbox.count() > 1:
                 it = self.msg_vbox.takeAt(0)
                 if it.widget(): it.widget().deleteLater()
             # Message d'info
-            info = QLabel("You were removed from this group.")
+            info = QLabel(tr("removed_from_group"))
             info.setStyleSheet(f"color:{C['text2']};padding:20px;")
             info.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.msg_vbox.insertWidget(0, info)
@@ -2696,12 +3061,20 @@ class VeloApp(QMainWindow):
         # Message d'un autre membre
         if content.startswith("[FILE]"):
             w = self._parse_attachment(content, False)
-            if w: self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, w)
+            if w:
+                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, w)
+                self._fade_in(w)
+            preview = "📎 Attachment"
         else:
             b = self._make_group_bubble(content, False,
                                         self.current_group_id, msg_id=msg_id,
                                         raw_content=content, sender_name=sender_name)
             self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, b)
+            self._fade_in(b)
+            preview = f"{sender_name}: {content}"
+        # Met à jour l'aperçu du groupe dans la liste
+        if self.current_group_id in self.groups:
+            self.groups[self.current_group_id].set_preview(preview)
         self._scroll_bottom()
 
     def _assign_group_sent_id(self, new_id, gid):
@@ -2724,6 +3097,7 @@ class VeloApp(QMainWindow):
     def _select_group(self, gid):
         if self.recv_id:
             self._clear_ephemeral(self.recv_id)
+        self._show_chat_area()
         # Si le groupe était masqué, on le ré-affiche
         if gid in self._load_hidden_groups():
             self._unhide_group(gid)
@@ -2733,7 +3107,7 @@ class VeloApp(QMainWindow):
         if gid in self.groups: self.groups[gid].set_selected(True)
         self.current_group_id = gid
         self.recv_id = None  # on est en mode groupe
-        self.view_prof.setText("Group settings")
+        self.view_prof.setText(tr("group_settings"))
         self.view_prof.setVisible(True)
         self.conv_settings_btn.setVisible(False)
         self.call_btn.setVisible(False)
@@ -2752,7 +3126,7 @@ class VeloApp(QMainWindow):
         if not g: return
         self.ch_av.refresh(g.get("name", "?"), g.get("avatar_url", ""))
         self.ch_name.setText(g.get("name", ""))
-        lock = "🔒 Private group" if g.get("is_private") else "Public group"
+        lock = "🔒 " + tr("private_group") if g.get("is_private") else tr("public_group")
         self.ch_sub.setText(lock)
 
     def _fill_group_history(self, msgs, gid):
@@ -2781,7 +3155,7 @@ class VeloApp(QMainWindow):
     def _make_group_bubble(self, text, outgoing, gid, msg_id=None, edited=False,
                            raw_content="", sender_name=None, indent=False):
         import datetime
-        now = datetime.datetime.now().strftime("%H:%M")
+        now = format_msg_time()
         b = Bubble(text, outgoing, msg_id=msg_id, edited=edited,
                    sender_name=sender_name, time_str=now, indent=indent)
         b._raw_content = raw_content  # contenu sans le préfixe "nom:"
@@ -2823,7 +3197,11 @@ class VeloApp(QMainWindow):
         self._async(api_get, self._fill_groups, "/groups/my", self.token)
 
     def _fill_groups(self, groups):
-        if groups is None: return
+        if groups is None:
+            # Échec réseau : on marque quand même pour ne pas bloquer le splash
+            self._loaded_flags["groups"] = True
+            self._maybe_close_splash()
+            return
         # Supprime les anciennes GroupRow
         for gid, row in list(self.groups.items()):
             row.deleteLater()
@@ -2839,6 +3217,8 @@ class VeloApp(QMainWindow):
             if g["id"] in hidden:
                 row.setVisible(False)
             pos += 1
+        self._loaded_flags["groups"] = True
+        self._maybe_close_splash()
 
     def _create_group(self):
         d = CreateGroupDialog(self.token, self)
@@ -2856,7 +3236,7 @@ class VeloApp(QMainWindow):
     def _set_can_send(self, can):
         self.inp.setEnabled(can)
         if can:
-            self.inp.setPlaceholderText("Message")
+            self.inp.setPlaceholderText(tr("message"))
         else:
             self.inp.setPlaceholderText("🔒 Add as friend to send messages")
 
@@ -2911,7 +3291,7 @@ class VeloApp(QMainWindow):
         sb = QVBoxLayout(sidebar); sb.setContentsMargins(0, 0, 0, 0); sb.setSpacing(0)
 
         hdr = QWidget(); hdr.setFixedHeight(58)
-        hdr.setStyleSheet(f"background:{C['sidebar']};border-bottom:1px solid {C['divider']};")
+        hdr.setStyleSheet(f"background:{C['sidebar']};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(14, 0, 12, 0)
         self.me_av = Avatar(self.user.get("username", "?"), 36, self.user.get("avatar_url", ""))
         self.me_av.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -2937,12 +3317,12 @@ class VeloApp(QMainWindow):
         chats_hdr = QWidget()
         chl2 = QHBoxLayout(chats_hdr);
         chl2.setContentsMargins(14, 10, 10, 2)
-        lbl = QLabel("CHATS")
+        lbl = QLabel(tr("chats"))
         lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         lbl.setStyleSheet(f"color:{C['text3']};letter-spacing:1px;")
         chl2.addWidget(lbl);
         chl2.addStretch()
-        new_group_btn = QPushButton("+ New group")
+        new_group_btn = QPushButton(tr("new_group"))
         new_group_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         new_group_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['accent']};
                     border:none;font-size:11px;font-weight:bold;font-family:'Segoe UI';}}
@@ -2955,7 +3335,7 @@ class VeloApp(QMainWindow):
         search_wrap = QWidget()
         swl = QHBoxLayout(search_wrap); swl.setContentsMargins(10, 2, 10, 6); swl.setSpacing(0)
         self.sidebar_search = QLineEdit()
-        self.sidebar_search.setPlaceholderText("🔍  Search conversations")
+        self.sidebar_search.setPlaceholderText("🔍  " + tr("search_conversations"))
         self.sidebar_search.setFixedHeight(36)
         self.sidebar_search.setStyleSheet(f"""QLineEdit{{background:{C['card']};color:{C['text']};
             border:none;border-radius:9px;padding:0 12px;font-size:12px;font-family:'Segoe UI';}}""")
@@ -2972,18 +3352,15 @@ class VeloApp(QMainWindow):
         scroll.setWidget(self.fbox); sb.addWidget(scroll)
         main.addWidget(sidebar)
 
-        sep = QFrame(); sep.setFixedWidth(1); sep.setStyleSheet(f"background:{C['divider']};")
-        main.addWidget(sep)
-
         # ── Chat ──────────────────────────────────────────
         chat = QWidget(); chat.setStyleSheet(f"background:{C['bg']};")
         cl = QVBoxLayout(chat); cl.setContentsMargins(0, 0, 0, 0); cl.setSpacing(0)
 
         self.ch_hdr = QWidget(); self.ch_hdr.setFixedHeight(58)
-        self.ch_hdr.setStyleSheet(f"background:{C['sidebar']};border-bottom:1px solid {C['divider']};")
+        self.ch_hdr.setStyleSheet(f"background:{C['sidebar']};")
         chl = QHBoxLayout(self.ch_hdr); chl.setContentsMargins(16, 0, 16, 0); chl.setSpacing(12)
         self.ch_av = Avatar("?", 38)
-        self.ch_name = QLabel("Select a chat")
+        self.ch_name = QLabel(tr("select_a_chat"))
         self.ch_name.setFont(QFont("Segoe UI", 14, QFont.Weight.DemiBold))
         self.ch_name.setStyleSheet(f"color:{C['text']};")
         self.ch_sub = QLabel(""); self.ch_sub.setFont(QFont("Segoe UI", 11))
@@ -3005,7 +3382,7 @@ class VeloApp(QMainWindow):
                    QPushButton:hover{{background:{C['hover']};color:{C['text']};}}""")
         self.conv_settings_btn.setVisible(False)
         self.conv_settings_btn.clicked.connect(self._open_conv_settings)
-        self.view_prof = btn("View profile", C["card"], C["text2"], font_size=12)
+        self.view_prof = btn(tr("view_profile"), C["card"], C["text2"], font_size=12)
         self.view_prof.setVisible(False);
         self.view_prof.clicked.connect(self._view_profile)
         chl.addWidget(self.ch_av);
@@ -3020,29 +3397,85 @@ class VeloApp(QMainWindow):
         self.msg_scroll.setStyleSheet(f"border:none;background:{C['bg']};")
         self.msg_box = QWidget(); self.msg_box.setStyleSheet(f"background:{C['bg']};")
         self.msg_vbox = QVBoxLayout(self.msg_box)
-        self.msg_vbox.setContentsMargins(0, 12, 0, 8); self.msg_vbox.setSpacing(2)
+        self.msg_vbox.setContentsMargins(0, 12, 0, 8)
+        self.msg_vbox.setSpacing(APPEARANCE.get("group_spacing", 2))
         self.msg_vbox.addStretch()
         self.msg_scroll.setWidget(self.msg_box); cl.addWidget(self.msg_scroll)
+
+        # Bouton flottant "descendre en bas" (apparaît quand on remonte)
+        self.scroll_btn = QPushButton("⬇", self.msg_scroll)
+        self.scroll_btn.setFixedSize(40, 40)
+        self.scroll_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.scroll_btn.setStyleSheet(f"""QPushButton{{background:{C['card']};color:{C['text']};
+            border:none;border-radius:20px;font-size:16px;}}
+            QPushButton:hover{{background:{C['accent']};color:white;}}""")
+        self.scroll_btn.clicked.connect(lambda: self._scroll_bottom())
+        self.scroll_btn.setVisible(False)
+        self.msg_scroll.verticalScrollBar().valueChanged.connect(self._on_scroll_changed)
+
+        # État vide : placeholder accueillant quand aucune conversation n'est ouverte
+        self.empty_state = QWidget()
+        self.empty_state.setStyleSheet(f"background:{C['bg']};")
+        es = QVBoxLayout(self.empty_state)
+        es.setContentsMargins(40, 40, 40, 40); es.setSpacing(14)
+        es.addStretch()
+        es_logo = QLabel()
+        if os.path.exists(LOGO_PATH):
+            es_logo.setPixmap(make_rounded_logo(LOGO_PATH, 96))
+            es_logo.setFixedSize(96, 96); es_logo.setScaledContents(True)
+        es_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es.addWidget(es_logo, alignment=Qt.AlignmentFlag.AlignHCenter)
+        es_t = QLabel(tr("welcome_title"))
+        es_t.setFont(QFont("Segoe UI", 19, QFont.Weight.Bold))
+        es_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_t.setStyleSheet(f"color:{C['text']};")
+        es.addWidget(es_t)
+        es_sub = QLabel(tr("welcome_sub"))
+        es_sub.setFont(QFont("Segoe UI", 12))
+        es_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_sub.setStyleSheet(f"color:{C['text2']};")
+        es.addWidget(es_sub)
+        es.addStretch()
+        cl.addWidget(self.empty_state)
+        # Au démarrage, on montre l'état vide et on cache la zone de messages
+        self.msg_scroll.setVisible(False)
         # Hide header avatar until a chat is open
         self.ch_av.setVisible(False)
 
-        ibw = QWidget(); ibw.setFixedHeight(66)
-        ibw.setStyleSheet(f"background:{C['sidebar']};border-top:1px solid {C['divider']};")
-        ib = QHBoxLayout(ibw); ib.setContentsMargins(14, 10, 14, 10); ib.setSpacing(10)
+        ibw = QWidget(); ibw.setFixedHeight(70)
+        ibw.setStyleSheet(f"background:{C['sidebar']};")
+        ib = QHBoxLayout(ibw); ib.setContentsMargins(14, 12, 14, 12); ib.setSpacing(8)
         attach_btn = QPushButton("＋")
-        attach_btn.setFixedSize(40, 40)
+        attach_btn.setFixedSize(42, 42)
         attach_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         attach_btn.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         attach_btn.setStyleSheet(f"""QPushButton{{background:{C['card']};color:{C['accent']};
-                   border:none;border-radius:20px;padding:0px;}}
+                   border:none;border-radius:21px;padding:0px;}}
                    QPushButton:hover{{background:{C['hover']};}}""")
         attach_btn.clicked.connect(self._attach_menu)
-        self.inp = QLineEdit(); self.inp.setPlaceholderText("Message")
-        self.inp.setFixedHeight(42)
-        self.inp.setStyleSheet(f"""QLineEdit{{background:{C['bg']};color:{C['text']};
-            border:none;border-radius:21px;padding:0 18px;font-size:13px;font-family:'Segoe UI';}}""")
+        # Conteneur arrondi qui regroupe le champ + bouton emoji
+        field_wrap = QWidget()
+        field_wrap.setStyleSheet(f"background:{C['bg']};border-radius:21px;")
+        field_wrap.setFixedHeight(44)
+        fw = QHBoxLayout(field_wrap); fw.setContentsMargins(6, 0, 6, 0); fw.setSpacing(4)
+        self.inp = QLineEdit(); self.inp.setPlaceholderText(tr("message"))
+        self.inp.setStyleSheet(f"""QLineEdit{{background:transparent;color:{C['text']};
+            border:none;padding:0 12px;font-size:13px;font-family:'Segoe UI';}}""")
         self.inp.returnPressed.connect(self.send_message)
         self.inp.textChanged.connect(self._on_typing)
+        emoji_btn = QPushButton("😊"); emoji_btn.setFixedSize(34, 34)
+        emoji_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        emoji_btn.setStyleSheet(f"""QPushButton{{background:transparent;border:none;
+            border-radius:17px;font-size:16px;}}
+            QPushButton:hover{{background:{C['hover']};}}""")
+        emoji_btn.clicked.connect(self._open_emoji)
+        gif_btn = QPushButton("GIF"); gif_btn.setFixedSize(38, 34)
+        gif_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        gif_btn.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['text2']};
+            border:none;border-radius:8px;font-size:11px;font-weight:bold;}}
+            QPushButton:hover{{background:{C['hover']};color:{C['text']};}}""")
+        gif_btn.clicked.connect(self._open_gif)
+        fw.addWidget(self.inp); fw.addWidget(emoji_btn); fw.addWidget(gif_btn)
         sbtn = QPushButton("➤"); sbtn.setFixedSize(44, 44)
         sbtn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         sbtn.setStyleSheet(f"""QPushButton{{background:{C['accent']};color:white;
@@ -3050,7 +3483,7 @@ class VeloApp(QMainWindow):
             QPushButton:hover{{background:{C['accent_h']};}}""")
         sbtn.clicked.connect(self.send_message)
         ib.addWidget(attach_btn)
-        ib.addWidget(self.inp); ib.addWidget(sbtn); cl.addWidget(ibw)
+        ib.addWidget(field_wrap); ib.addWidget(sbtn); cl.addWidget(ibw)
         main.addWidget(chat)
 
         # Add main app as page 0; settings page built lazily
@@ -3167,6 +3600,23 @@ class VeloApp(QMainWindow):
             if u["id"] in hidden:
                 row.setVisible(False)
             pos += 1
+        self._loaded_flags["friends"] = True
+        self._maybe_close_splash()
+
+    def _maybe_close_splash(self):
+        # Ferme le splash quand amis ET groupes sont chargés
+        if self._splash is None:
+            return
+        if self._loaded_flags.get("friends") and self._loaded_flags.get("groups"):
+            sp = self._splash
+            self._splash = None
+            sp.stop()
+
+    def _force_close_splash(self):
+        if self._splash is not None:
+            sp = self._splash
+            self._splash = None
+            sp.stop()
 
     def _refresh_badge(self):
         reqs = api_get("/friends/requests", self.token) or []
@@ -3181,10 +3631,17 @@ class VeloApp(QMainWindow):
                 border:none;border-radius:17px;font-size:17px;}}
                 QPushButton:hover{{background:{C['hover']};color:{C['text']};}}""")
 
+    def _show_chat_area(self):
+        # Bascule de l'état vide vers la zone de messages
+        if hasattr(self, "empty_state"):
+            self.empty_state.setVisible(False)
+        self.msg_scroll.setVisible(True)
+
     def _select(self, uid):
         prev = self.recv_id
         if prev and prev != uid:
             self._clear_ephemeral(prev)
+        self._show_chat_area()
         self.current_group_id = None
         # Ferme proprement le WS de groupe (pour ne pas déclencher de faux kick)
         if self.group_ws:
@@ -3203,7 +3660,7 @@ class VeloApp(QMainWindow):
         self._async(api_post, lambda r: None, "/chat/mark_read", self.token, {"other_user_id": uid})
         if uid in self.friends:
             self.friends[uid].clear_unread()
-        self.view_prof.setText("View profile")
+        self.view_prof.setText(tr("view_profile"))
         self.view_prof.setVisible(True)
         self.conv_settings_btn.setVisible(True)
         self.call_btn.setVisible(True)
@@ -3232,7 +3689,7 @@ class VeloApp(QMainWindow):
 
     def _make_bubble(self, content, outgoing, msg_id=None, edited=False):
         import datetime
-        now = datetime.datetime.now().strftime("%H:%M")
+        now = format_msg_time()
         b = Bubble(content, outgoing, msg_id=msg_id, edited=edited, time_str=now)
         if msg_id is not None:
             self._bubbles[msg_id] = b
@@ -3285,20 +3742,31 @@ class VeloApp(QMainWindow):
     def _fill_history(self, msgs, uid):
         if msgs is None or uid != self.recv_id: return
         self._bubbles.clear()
-        for i, m in enumerate(msgs):
+        pos = 0  # position d'insertion (avant le stretch final)
+        prev_date = None
+        for m in msgs:
             content = m["content"]
             outgoing = m["sender_id"] == self.user["id"]
+            # Séparateur de date si le jour change
+            created = m.get("created_at")
+            if created:
+                dlabel = format_date_label(created)
+                if dlabel and dlabel != prev_date:
+                    self.msg_vbox.insertWidget(pos, make_date_separator(dlabel))
+                    pos += 1
+                    prev_date = dlabel
             if content.startswith("[GROUP_INVITE]"):
                 gid = int(content.replace("[GROUP_INVITE]", ""))
                 card = InviteCard(self.token, self.user, gid)
                 card.joined.connect(self._load_groups)
-                self.msg_vbox.insertWidget(i, card)
+                self.msg_vbox.insertWidget(pos, card)
             elif content.startswith("[FILE]"):
                 w = self._parse_attachment(content, outgoing)
-                if w: self.msg_vbox.insertWidget(i, w)
+                if w: self.msg_vbox.insertWidget(pos, w)
             else:
-                self.msg_vbox.insertWidget(i, self._make_bubble(
+                self.msg_vbox.insertWidget(pos, self._make_bubble(
                     content, outgoing, msg_id=m.get("id"), edited=m.get("edited", False)))
+            pos += 1
         self._scroll_bottom()
 
     #websocket
@@ -3389,9 +3857,13 @@ class VeloApp(QMainWindow):
             self._hide_typing()
             if message.startswith("[FILE]"):
                 w = self._parse_attachment(message, False)
-                if w: self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, w)
+                if w:
+                    self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, w)
+                    self._fade_in(w)
             else:
-                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, Bubble(message, False))
+                b = self._make_bubble(message, False)
+                self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, b)
+                self._fade_in(b)
             self._scroll_bottom()
             if sender_id in self.friends:
                 preview = "📎 Attachment" if message.startswith("[FILE]") else message
@@ -3443,8 +3915,12 @@ class VeloApp(QMainWindow):
                                                  msg_id=None, raw_content=text)
                 self._pending_group_bubble = bubble  # pour recevoir son id
                 self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, bubble)
+                self._fade_in(bubble)
                 self.inp.clear()
                 self._scroll_bottom()
+                # Met à jour l'aperçu du groupe dans la liste
+                if self.current_group_id in self.groups:
+                    self.groups[self.current_group_id].set_preview(f"You: {text}")
             except Exception as ex:
                 print("group send error:", ex)
             return
@@ -3455,15 +3931,69 @@ class VeloApp(QMainWindow):
             bubble = self._make_bubble(text, True, msg_id=None)
             self._pending_sent_bubble = bubble  # pour recevoir son id via [NEWID]
             self.msg_vbox.insertWidget(self.msg_vbox.count() - 1, bubble)
+            self._fade_in(bubble)
             self.inp.clear()
             self._set_msg_status("✓ Delivered")
             self._scroll_bottom()
+            # Met à jour l'aperçu DM dans la liste
+            if self.recv_id in self.friends:
+                self.friends[self.recv_id].set_preview(f"You: {text}")
         except Exception as ex:
             print("send error:", ex)
 
-    def _scroll_bottom(self):
-        QTimer.singleShot(60, lambda: self.msg_scroll.verticalScrollBar().setValue(
-            self.msg_scroll.verticalScrollBar().maximum()))
+    def _fade_in(self, widget, duration=180):
+        # Petit fondu d'apparition pour les nouveaux messages
+        from PyQt6.QtWidgets import QGraphicsOpacityEffect
+        eff = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(eff)
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(duration)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.start()
+        # Garde une référence pour éviter le garbage collection
+        if not hasattr(self, "_fade_anims"):
+            self._fade_anims = []
+        self._fade_anims.append(anim)
+        if len(self._fade_anims) > 30:
+            self._fade_anims = self._fade_anims[-15:]
+
+    def _on_scroll_changed(self, value):
+        bar = self.msg_scroll.verticalScrollBar()
+        # Affiche le bouton si on est remonté de plus de 200px du bas
+        far_from_bottom = (bar.maximum() - value) > 200
+        self.scroll_btn.setVisible(far_from_bottom)
+        self._reposition_scroll_btn()
+
+    def _reposition_scroll_btn(self):
+        # Coin bas-droit de la zone de messages
+        if hasattr(self, "scroll_btn"):
+            m = 16
+            x = self.msg_scroll.width() - self.scroll_btn.width() - m
+            y = self.msg_scroll.height() - self.scroll_btn.height() - m
+            self.scroll_btn.move(x, y)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._reposition_scroll_btn()
+
+    def _scroll_bottom(self, animate=True):
+        def do_scroll():
+            bar = self.msg_scroll.verticalScrollBar()
+            target = bar.maximum()
+            if not animate or abs(target - bar.value()) < 4:
+                bar.setValue(target)
+                return
+            # Animation douce vers le bas
+            anim = QPropertyAnimation(bar, b"value", self)
+            anim.setDuration(220)
+            anim.setStartValue(bar.value())
+            anim.setEndValue(target)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.start()
+            self._scroll_anim = anim  # garde une référence pour éviter le GC
+        QTimer.singleShot(60, do_scroll)
 
     # ── Dialogs ───────────────────────────────────────────
     def _open_settings(self):
@@ -3545,7 +4075,7 @@ class VeloApp(QMainWindow):
 
     def _on_left_group(self):
         self.current_group_id = None
-        self.ch_name.setText("Select a chat")
+        self.ch_name.setText(tr("select_a_chat"))
         self.ch_sub.setText("")
         self.view_prof.setVisible(False)
         while self.msg_vbox.count() > 1:
@@ -3598,8 +4128,13 @@ if __name__ == "__main__":
                 break
             token = login.token
             user = login.user
-        win = VeloApp(token, user)
+        # Écran de chargement pendant la construction de l'app
+        splash = SplashScreen()
+        splash.show()
+        app.processEvents()  # affiche le splash immédiatement
+        win = VeloApp(token, user, splash=splash)
         win.show()
+        # Le splash se ferme tout seul quand les données sont chargées
         app.exec()
         if not _RELOGIN:
             break
