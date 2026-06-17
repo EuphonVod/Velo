@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from pydantic import BaseModel
 
 from app.dependencies import get_db
@@ -192,3 +192,105 @@ async def admin_group_members(
                 "role": m.role,
             })
     return result
+
+@router.get("/alt_accounts")
+async def admin_alt_accounts(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(select(User).where(User.id == user_id))
+    target = res.scalar_one_or_none()
+    if not target or not target.ip:
+        return []
+    others = await db.execute(
+        select(User).where(User.ip == target.ip, User.id != user_id).order_by(User.id))
+    return [
+        {"id": u.id, "username": u.username, "email": u.email,
+         "ip": u.ip or "", "is_superuser": u.is_superuser,
+         "is_private": u.is_private,
+         "created_at": u.created_at.isoformat() if u.created_at else None}
+        for u in others.scalars().all()
+    ]
+
+@router.get("/stats")
+async def admin_stats(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    users = await db.scalar(select(func.count()).select_from(User))
+    groups = await db.scalar(select(func.count()).select_from(Group))
+    dms = await db.scalar(select(func.count()).select_from(Message))
+    gmsgs = await db.scalar(select(func.count()).select_from(GroupMessage))
+    banned = await db.scalar(select(func.count()).select_from(GlobalBannedIP))
+    return {"users": users or 0, "groups": groups or 0,
+            "dm_messages": dms or 0, "group_messages": gmsgs or 0,
+            "banned_ips": banned or 0}
+
+class UnbanIP(BaseModel):
+    ip: str
+
+@router.get("/banned_ips")
+async def admin_banned_ips(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(select(GlobalBannedIP).order_by(GlobalBannedIP.id))
+    return [{"id": b.id, "ip": b.ip, "reason": b.reason or ""}
+            for b in res.scalars().all()]
+
+@router.post("/unban_ip")
+async def admin_unban_ip(
+    data: UnbanIP,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    await db.execute(delete(GlobalBannedIP).where(GlobalBannedIP.ip == data.ip))
+    await db.commit()
+    return {"status": "unbanned"}
+
+class SetAdmin(BaseModel):
+    user_id: int
+    make_admin: bool
+
+@router.post("/set_admin")
+async def admin_set_admin(
+    data: SetAdmin,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(select(User).where(User.id == data.user_id))
+    target = res.scalar_one_or_none()
+    if not target:
+        raise HTTPException(404, "User not found")
+    target.is_superuser = data.make_admin
+    await db.commit()
+    return {"status": "ok", "is_superuser": target.is_superuser}
+
+@router.get("/user_messages")
+async def admin_user_messages(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    dm = await db.execute(
+        select(Message).where(Message.sender_id == user_id)
+        .order_by(Message.created_at.desc()).limit(20))
+    gm = await db.execute(
+        select(GroupMessage).where(GroupMessage.sender_id == user_id)
+        .order_by(GroupMessage.created_at.desc()).limit(20))
+    msgs = []
+    for m in dm.scalars().all():
+        msgs.append({"type": "DM", "content": m.content,
+                     "at": m.created_at.isoformat() if m.created_at else ""})
+    for m in gm.scalars().all():
+        msgs.append({"type": "Group", "content": m.content,
+                     "at": m.created_at.isoformat() if m.created_at else ""})
+    msgs.sort(key=lambda x: x["at"], reverse=True)
+    return msgs[:30]
