@@ -62,3 +62,28 @@ async def admin_ban_user(
     await db.delete(target)
     await db.commit()
     return {"status": "banned"}
+
+@router.get("/users")
+async def admin_list_users(
+    q: str = "",
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    query = select(User)
+    if q:
+        # Recherche par username ou id
+        if q.isdigit():
+            query = query.where(User.id == int(q))
+        else:
+            query = query.where(User.slug.ilike(f"%{q.lower()}%"))
+    res = await db.execute(query)
+    users = res.scalars().all()
+    return [
+        {
+            "id": u.id, "username": u.username, "email": u.email,
+            "ip": u.ip or "", "is_superuser": u.is_superuser,
+            "created_at": str(u.created_at),
+        }
+        for u in users
+    ]
