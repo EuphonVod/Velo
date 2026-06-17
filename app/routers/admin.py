@@ -4,7 +4,9 @@ from sqlalchemy import select, delete
 from pydantic import BaseModel
 
 from app.dependencies import get_db
-from app.models.group import Group, GroupMember, GroupMessage
+from app.models.friendship import Friendship
+from app.models.group import Group, GroupMember, GroupMessage, GroupBan, GroupInvite, GroupBannedIP
+from app.models.message import Message
 from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user
 from datetime import datetime
@@ -21,7 +23,19 @@ def _require_admin(current_user: User):
         raise HTTPException(status_code=403, detail="Admin only")
 
 
-#del account
+
+async def _purge_user(db, user_id):
+    await db.execute(delete(Message).where(Message.sender_id == user_id))
+    await db.execute(delete(Message).where(Message.receiver_id == user_id))
+    await db.execute(delete(GroupMessage).where(GroupMessage.sender_id == user_id))
+    await db.execute(delete(GroupMember).where(GroupMember.user_id == user_id))
+    await db.execute(delete(GroupBan).where(GroupBan.user_id == user_id))
+    await db.execute(delete(GroupInvite).where(GroupInvite.invited_user_id == user_id))
+    await db.execute(delete(GroupInvite).where(GroupInvite.invited_by_id == user_id))
+    await db.execute(delete(Friendship).where(Friendship.requester_id == user_id))
+    await db.execute(delete(Friendship).where(Friendship.addressee_id == user_id))
+
+
 @router.post("/delete_user")
 async def admin_delete_user(
     data: AdminUserAction,
@@ -35,12 +49,12 @@ async def admin_delete_user(
         raise HTTPException(404, "User not found")
     if target.is_superuser:
         raise HTTPException(403, "Cannot delete another admin")
+    await _purge_user(db, target.id)
     await db.delete(target)
     await db.commit()
     return {"status": "deleted"}
 
 
-#global ban
 @router.post("/ban_user")
 async def admin_ban_user(
     data: AdminUserAction,
@@ -54,13 +68,12 @@ async def admin_ban_user(
         raise HTTPException(404, "User not found")
     if target.is_superuser:
         raise HTTPException(403, "Cannot ban another admin")
-    #blaklist ip
     if target.ip:
         ex = await db.execute(
             select(GlobalBannedIP).where(GlobalBannedIP.ip == target.ip))
         if not ex.scalar_one_or_none():
             db.add(GlobalBannedIP(ip=target.ip, reason=f"Banned user {target.username}"))
-    # Supprime le compte
+    await _purge_user(db, target.id)
     await db.delete(target)
     await db.commit()
     return {"status": "banned"}
@@ -146,8 +159,12 @@ async def admin_delete_group(
     g = res.scalar_one_or_none()
     if not g:
         raise HTTPException(404, "Group not found")
-    await db.execute(delete(GroupMessage).where(GroupMessage.group_id == data.group_id))
-    await db.execute(delete(GroupMember).where(GroupMember.group_id == data.group_id))
+    gid = data.group_id
+    await db.execute(delete(GroupMessage).where(GroupMessage.group_id == gid))
+    await db.execute(delete(GroupMember).where(GroupMember.group_id == gid))
+    await db.execute(delete(GroupBan).where(GroupBan.group_id == gid))
+    await db.execute(delete(GroupInvite).where(GroupInvite.group_id == gid))
+    await db.execute(delete(GroupBannedIP).where(GroupBannedIP.group_id == gid))
     await db.delete(g)
     await db.commit()
     return {"status": "deleted"}
