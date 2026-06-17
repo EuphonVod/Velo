@@ -10,3 +10,4 @@ migrate.py
 appearance.json
 hidden_convs.json
 hidden_groups.json
+velo_admin_panel.py

@@ -34,6 +34,7 @@ class UserResponse(BaseModel):
     last_seen: Optional[datetime] = None
     created_at: datetime
     slug: Optional[str] = ""
+    is_superuser: Optional[bool] = False
 
     model_config = {"from_attributes": True}
 

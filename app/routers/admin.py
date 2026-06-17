@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from app.dependencies import get_db
 from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user
+from datetime import datetime
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -63,6 +64,19 @@ async def admin_ban_user(
     await db.commit()
     return {"status": "banned"}
 
+
+class AdminUserView(BaseModel):
+    id: int
+    username: str
+    email: str
+    ip: str | None = ""
+    is_superuser: bool = False
+    is_private: bool = False
+    created_at: datetime | None = None
+    class Config:
+        from_attributes = True
+
+
 @router.get("/users")
 async def admin_list_users(
     q: str = "",
@@ -72,18 +86,19 @@ async def admin_list_users(
     _require_admin(current_user)
     query = select(User)
     if q:
-        # Recherche par username ou id
+        # Recherche par username (partiel) ou par id exact
         if q.isdigit():
             query = query.where(User.id == int(q))
         else:
-            query = query.where(User.slug.ilike(f"%{q.lower()}%"))
-    res = await db.execute(query)
+            query = query.where(User.username.ilike(f"%{q}%"))
+    res = await db.execute(query.order_by(User.id))
     users = res.scalars().all()
     return [
         {
             "id": u.id, "username": u.username, "email": u.email,
             "ip": u.ip or "", "is_superuser": u.is_superuser,
-            "created_at": str(u.created_at),
+            "is_private": u.is_private,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
         }
         for u in users
     ]
