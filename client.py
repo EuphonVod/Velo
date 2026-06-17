@@ -4,12 +4,13 @@ import json
 import requests
 import websocket
 import threading
+import html as _html
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QLineEdit,
     QPushButton, QVBoxLayout, QHBoxLayout, QScrollArea, QTextEdit,
     QFileDialog, QFrame, QSizePolicy, QStackedWidget, QMenu,
-    QGridLayout, QComboBox, QInputDialog, QMessageBox, QSlider
+    QGridLayout, QComboBox, QInputDialog, QMessageBox, QSlider, QListWidget, QListWidgetItem
 )
 from PyQt6.QtCore import (
     Qt, QTimer, pyqtSignal, QRect, QThread, QObject,
@@ -59,6 +60,21 @@ def format_msg_time(dt=None):
     if APPEARANCE.get("time_format", "24h") == "12h":
         return dt.strftime("%I:%M %p").lstrip("0")
     return dt.strftime("%H:%M")
+
+def render_mentions(text, my_username=None):
+    """Transforme @mentions en HTML coloré. Échappe le reste du texte."""
+    # Échappe le HTML pour la sécurité
+    escaped = _html.escape(text)
+    # Repère les @mentions (lettres, chiffres, _ après @)
+    import re
+    def repl(m):
+        name = m.group(1)
+        # Couleur plus vive si c'est MOI qui suis mentionné
+        is_me = my_username and name.lower() == my_username.lower()
+        color = C["accent"] if not is_me else C["orange"]
+        weight = "bold" if is_me else "600"
+        return f'<span style="color:{color};font-weight:{weight};">@{name}</span>'
+    return re.sub(r'@(\w+)', repl, escaped)
 
 
 def format_date_label(iso_str):
@@ -498,7 +514,8 @@ class Bubble(QWidget):
         self.lbl.setFont(QFont("Segoe UI", APPEARANCE.get("font_size", 12)))
         self.lbl.setStyleSheet(f"color:{C['text']};background:transparent;")
         self.lbl.setMaximumWidth(510)
-        self.lbl.setText(text)
+        self.lbl.setText(render_mentions(text, getattr(self, "_my_username", None)))
+        self.lbl.setTextFormat(Qt.TextFormat.RichText)
         inner.addWidget(self.lbl)
 
         # Pied : "(edited)" à gauche + heure à droite, même couleur discrète
@@ -560,6 +577,7 @@ class FriendRow(QWidget):
     hide_requested = pyqtSignal(int)
     def __init__(self, user, parent=None):
         super().__init__(parent)
+        self._my_username = None
         self.uid = user["id"]; self.uname = user.get("username", "?")
         self._sel = False
         self.setFixedHeight(64)
@@ -2597,6 +2615,32 @@ class SplashScreen(QWidget):
         self._dot_timer.stop()
         self.close()
 
+class MentionPopup(QListWidget):
+    """Liste d'autocomplétion pour les @mentions."""
+    picked = pyqtSignal(str)  # username choisi
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Popup)
+        self.setStyleSheet(f"""
+            QListWidget {{background:{C['card']};border:1px solid {C['divider']};
+                border-radius:10px;padding:4px;outline:none;
+                font-family:'Segoe UI';font-size:13px;color:{C['text']};}}
+            QListWidget::item {{padding:7px 12px;border-radius:6px;}}
+            QListWidget::item:selected {{background:{C['accent']};color:white;}}
+            QListWidget::item:hover {{background:{C['hover']};}}
+        """)
+        self.itemClicked.connect(lambda it: self.picked.emit(it.data(Qt.ItemDataRole.UserRole)))
+
+    def set_members(self, members):
+        """members = liste de dicts {username, ...}"""
+        self.clear()
+        for m in members[:8]:  # max 8 suggestions
+            uname = m.get("username", "?")
+            it = QListWidgetItem(f"@{uname}")
+            it.setData(Qt.ItemDataRole.UserRole, uname)
+            self.addItem(it)
+        if self.count() > 0:
+            self.setCurrentRow(0)
 
 class VeloApp(QMainWindow):
     sig_msg = pyqtSignal(str, int)
@@ -2665,6 +2709,63 @@ class VeloApp(QMainWindow):
         self._typing_timer.timeout.connect(self._stop_typing)
         self._is_typing = False
         self.typing_bubble = None
+        self.mention_popup = MentionPopup(self)
+        self.mention_popup.picked.connect(self._insert_mention)
+
+    def _get_mention_candidates(self):
+        """Renvoie la liste des personnes mentionnables selon le contexte."""
+        # En groupe : les membres du groupe
+        if self.current_group_id:
+            members = getattr(self, "_current_group_members", None)
+            if members:
+                return members
+            return []
+        # En DM : la personne à qui on parle
+        if self.recv_id and self.recv_id in self.friends:
+            row = self.friends[self.recv_id]
+            uname = getattr(row, "uname", None)
+            if uname:
+                return [{"username": uname}]
+        return []
+
+    def _check_mention_trigger(self, text):
+        # Cherche un @mot juste avant le curseur
+        cursor_pos = self.inp.cursorPosition()
+        before = text[:cursor_pos]
+        import re
+        m = re.search(r'@(\w*)$', before)
+        if not m:
+            self.mention_popup.hide()
+            return
+        query = m.group(1).lower()
+        # Filtre les candidats
+        candidates = self._get_mention_candidates()
+        filtered = [c for c in candidates
+                    if c.get("username", "").lower().startswith(query)]
+        if not filtered:
+            self.mention_popup.hide()
+            return
+        self.mention_popup.set_members(filtered)
+        # Positionne le popup au-dessus du champ
+        pos = self.inp.mapToGlobal(self.inp.rect().topLeft())
+        h = min(self.mention_popup.sizeHintForRow(0) * len(filtered) + 10, 250)
+        self.mention_popup.setFixedHeight(h)
+        self.mention_popup.setFixedWidth(220)
+        self.mention_popup.move(pos.x(), pos.y() - h - 6)
+        self.mention_popup.show()
+
+    def _insert_mention(self, username):
+        # Remplace le @mot en cours par @username complet
+        text = self.inp.text()
+        cursor_pos = self.inp.cursorPosition()
+        before = text[:cursor_pos]
+        after = text[cursor_pos:]
+        import re
+        new_before = re.sub(r'@(\w*)$', f'@{username} ', before)
+        self.inp.setText(new_before + after)
+        self.inp.setCursorPosition(len(new_before))
+        self.mention_popup.hide()
+        self.inp.setFocus()
 
     def _toggle_camera(self):
         if getattr(self, "_video_mode", None) == "camera":
@@ -3463,6 +3564,7 @@ class VeloApp(QMainWindow):
             border:none;padding:0 12px;font-size:13px;font-family:'Segoe UI';}}""")
         self.inp.returnPressed.connect(self.send_message)
         self.inp.textChanged.connect(self._on_typing)
+        self.inp.textChanged.connect(self._check_mention_trigger)
         emoji_btn = QPushButton("😊"); emoji_btn.setFixedSize(34, 34)
         emoji_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         emoji_btn.setStyleSheet(f"""QPushButton{{background:transparent;border:none;

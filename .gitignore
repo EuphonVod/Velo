@@ -6,3 +6,7 @@ uploads_files/
 audio_config.json
 gif_favorites.json
 test.py
+migrate.py
+appearance.json
+hidden_convs.json
+hidden_groups.json
