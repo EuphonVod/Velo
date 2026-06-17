@@ -1,3 +1,5 @@
+import urllib
+
 from fastapi import APIRouter, Depends, HTTPException
 from app.schemas.user import UserCreate, UserResponse, UserLogin, Token, UserUpdate, PasswordChange, EmailChange, AccountDelete
 import bcrypt
@@ -29,7 +31,7 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     existing_email = await db.execute(select(User).where(User.email == user.email))
     if existing_email.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already exists")
-
+    public_ip = urllib.request.urlopen('https://ident.me').read().decode('utf8')
     password_bytes = user.password.encode("utf-8")
     salt = bcrypt.gensalt()
     hashed_password = bcrypt.hashpw(password_bytes, salt).decode("utf-8")
@@ -41,6 +43,7 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
         slug=user.username.lower(),
         bio="",
         avatar_url="",
+        ip=public_ip,
     )
     db.add(user_db)
     await db.commit()

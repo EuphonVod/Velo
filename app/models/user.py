@@ -19,3 +19,4 @@ class User(Base):
     is_private: Mapped[bool] = mapped_column(default=False, nullable=True)
     show_online: Mapped[bool] = mapped_column(default=True, nullable=True)
     last_seen: Mapped[datetime] = mapped_column(default=datetime.now, nullable=True)
+    ip = Mapped[str] = mapped_column(index=True, unique=True)
