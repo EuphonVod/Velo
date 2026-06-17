@@ -11,6 +11,7 @@ from sqlalchemy import select, or_
 from app.dependencies import get_current_user
 import jwt
 import os
+from app.models.moderation import Warning
 
 
 
@@ -195,4 +196,33 @@ async def delete_account(
     await db.delete(user_db)
     await db.commit()
     return {"status": "ok"}
+
+
+@router.get("/my_standing")
+async def my_standing(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(
+        select(Warning).where(Warning.user_id == current_user.id)
+        .order_by(Warning.created_at.desc()))
+    warnings = res.scalars().all()
+    severe = sum(1 for w in warnings if w.severity == "severe")
+    total = len(warnings)
+    # Détermine le statut global du compte
+    if severe >= 2 or total >= 4:
+        status = "limited"      # compte limité
+    elif total >= 1:
+        status = "warning"      # avertissements actifs
+    else:
+        status = "good"         # tout va bien
+    return {
+        "status": status,
+        "total": total,
+        "warnings": [
+            {"reason": w.reason, "severity": w.severity,
+             "at": w.created_at.isoformat() if w.created_at else ""}
+            for w in warnings
+        ],
+    }
 

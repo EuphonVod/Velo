@@ -7,6 +7,7 @@ from app.dependencies import get_db
 from app.models.friendship import Friendship
 from app.models.group import Group, GroupMember, GroupMessage, GroupBan, GroupInvite, GroupBannedIP
 from app.models.message import Message
+from app.models.moderation import Report, AdminNote
 from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user
 from datetime import datetime
@@ -287,10 +288,252 @@ async def admin_user_messages(
         .order_by(GroupMessage.created_at.desc()).limit(20))
     msgs = []
     for m in dm.scalars().all():
-        msgs.append({"type": "DM", "content": m.content,
+        rec = await db.execute(select(User).where(User.id == m.receiver_id))
+        ru = rec.scalar_one_or_none()
+        to = ru.username if ru else f"#{m.receiver_id}"
+        msgs.append({"type": "DM", "content": m.content, "to": to,
                      "at": m.created_at.isoformat() if m.created_at else ""})
     for m in gm.scalars().all():
-        msgs.append({"type": "Group", "content": m.content,
+        gres = await db.execute(select(Group).where(Group.id == m.group_id))
+        g = gres.scalar_one_or_none()
+        to = g.name if g else f"group #{m.group_id}"
+        msgs.append({"type": "Group", "content": m.content, "to": to,
                      "at": m.created_at.isoformat() if m.created_at else ""})
     msgs.sort(key=lambda x: x["at"], reverse=True)
     return msgs[:30]
+
+@router.get("/search_messages")
+async def admin_search_messages(
+    q: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    if not q or len(q) < 2:
+        return []
+    results = []
+    # DM contenant le mot-clé
+    dm = await db.execute(
+        select(Message).where(Message.content.ilike(f"%{q}%"))
+        .order_by(Message.created_at.desc()).limit(40))
+    for m in dm.scalars().all():
+        s = await db.execute(select(User).where(User.id == m.sender_id))
+        su = s.scalar_one_or_none()
+        results.append({"msg_id": m.id, "kind": "dm", "type": "DM",
+                        "content": m.content,
+                        "sender": su.username if su else f"#{m.sender_id}",
+                        "sender_id": m.sender_id,
+                        "at": m.created_at.isoformat() if m.created_at else ""})
+    # Messages de groupe
+    gm = await db.execute(
+        select(GroupMessage).where(GroupMessage.content.ilike(f"%{q}%"))
+        .order_by(GroupMessage.created_at.desc()).limit(40))
+    for m in gm.scalars().all():
+        s = await db.execute(select(User).where(User.id == m.sender_id))
+        su = s.scalar_one_or_none()
+        results.append({"msg_id": m.id, "kind": "group", "type": "Group",
+                        "content": m.content,
+                        "sender": su.username if su else f"#{m.sender_id}",
+                        "sender_id": m.sender_id,
+                        "at": m.created_at.isoformat() if m.created_at else ""})
+    results.sort(key=lambda x: x["at"], reverse=True)
+    return results[:60]
+
+
+class DeleteMsg(BaseModel):
+    msg_id: int
+    kind: str  # "dm" ou "group"
+
+@router.post("/delete_message")
+async def admin_delete_message(
+    data: DeleteMsg,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    if data.kind == "dm":
+        await db.execute(delete(Message).where(Message.id == data.msg_id))
+    else:
+        await db.execute(delete(GroupMessage).where(GroupMessage.id == data.msg_id))
+    await db.commit()
+    return {"status": "deleted"}
+
+class CreateReport(BaseModel):
+    reported_user_id: int
+    reason: str
+
+# Route appelée par le CLIENT (pas admin) pour signaler quelqu'un
+@router.post("/report")
+async def create_report(
+    data: CreateReport,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    db.add(Report(reporter_id=current_user.id,
+                  reported_user_id=data.reported_user_id, reason=data.reason))
+    await db.commit()
+    return {"status": "ok"}
+
+@router.get("/reports")
+async def admin_reports(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(select(Report).order_by(Report.created_at.desc()).limit(100))
+    out = []
+    for r in res.scalars().all():
+        rep = await db.execute(select(User).where(User.id == r.reporter_id))
+        tgt = await db.execute(select(User).where(User.id == r.reported_user_id))
+        ru, tu = rep.scalar_one_or_none(), tgt.scalar_one_or_none()
+        out.append({"id": r.id, "reason": r.reason, "status": r.status,
+                    "reporter": ru.username if ru else f"#{r.reporter_id}",
+                    "reported": tu.username if tu else f"#{r.reported_user_id}",
+                    "reported_id": r.reported_user_id,
+                    "at": r.created_at.isoformat() if r.created_at else ""})
+    return out
+
+class ReportAction(BaseModel):
+    report_id: int
+
+@router.post("/resolve_report")
+async def admin_resolve_report(
+    data: ReportAction,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(select(Report).where(Report.id == data.report_id))
+    r = res.scalar_one_or_none()
+    if r:
+        r.status = "resolved"
+        await db.commit()
+    return {"status": "ok"}
+
+@router.get("/group_bans")
+async def admin_group_bans(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    out = []
+    # Bans par user
+    res = await db.execute(select(GroupBan).where(GroupBan.group_id == group_id))
+    for b in res.scalars().all():
+        u = await db.execute(select(User).where(User.id == b.user_id))
+        uu = u.scalar_one_or_none()
+        out.append({"kind": "user", "ban_id": b.id,
+                    "label": uu.username if uu else f"#{b.user_id}",
+                    "until": b.until.isoformat() if b.until else "permanent"})
+    # Bans par IP
+    res2 = await db.execute(select(GroupBannedIP).where(GroupBannedIP.group_id == group_id))
+    for b in res2.scalars().all():
+        out.append({"kind": "ip", "ban_id": b.id, "label": b.ip, "until": "permanent"})
+    return out
+
+
+class GroupUnban(BaseModel):
+    ban_id: int
+    kind: str  # "user" ou "ip"
+
+@router.post("/group_unban")
+async def admin_group_unban(
+    data: GroupUnban,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    if data.kind == "user":
+        await db.execute(delete(GroupBan).where(GroupBan.id == data.ban_id))
+    else:
+        await db.execute(delete(GroupBannedIP).where(GroupBannedIP.id == data.ban_id))
+    await db.commit()
+    return {"status": "ok"}
+
+class AddNote(BaseModel):
+    user_id: int
+    note: str
+
+@router.get("/notes")
+async def admin_get_notes(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(
+        select(AdminNote).where(AdminNote.user_id == user_id)
+        .order_by(AdminNote.created_at.desc()))
+    return [{"id": n.id, "note": n.note,
+             "at": n.created_at.isoformat() if n.created_at else ""}
+            for n in res.scalars().all()]
+
+@router.post("/add_note")
+async def admin_add_note(
+    data: AddNote,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    db.add(AdminNote(user_id=data.user_id, note=data.note))
+    await db.commit()
+    return {"status": "ok"}
+
+class NoteAction(BaseModel):
+    note_id: int
+
+@router.post("/delete_note")
+async def admin_delete_note(
+    data: NoteAction,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    await db.execute(delete(AdminNote).where(AdminNote.id == data.note_id))
+    await db.commit()
+    return {"status": "ok"}
+
+class AddWarning(BaseModel):
+    user_id: int
+    reason: str
+    severity: str = "warning"  # "warning" ou "severe"
+
+@router.post("/add_warning")
+async def admin_add_warning(
+    data: AddWarning,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    db.add(Warning(user_id=data.user_id, reason=data.reason, severity=data.severity))
+    await db.commit()
+    return {"status": "ok"}
+
+@router.get("/warnings")
+async def admin_get_warnings(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(
+        select(Warning).where(Warning.user_id == user_id)
+        .order_by(Warning.created_at.desc()))
+    return [{"id": w.id, "reason": w.reason, "severity": w.severity,
+             "at": w.created_at.isoformat() if w.created_at else ""}
+            for w in res.scalars().all()]
+
+class WarningAction(BaseModel):
+    warning_id: int
+
+@router.post("/delete_warning")
+async def admin_delete_warning(
+    data: WarningAction,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    await db.execute(delete(Warning).where(Warning.id == data.warning_id))
+    await db.commit()
+    return {"status": "ok"}
