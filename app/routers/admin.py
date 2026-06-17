@@ -168,3 +168,27 @@ async def admin_delete_group(
     await db.delete(g)
     await db.commit()
     return {"status": "deleted"}
+
+@router.get("/group_members")
+async def admin_group_members(
+    group_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(
+        select(GroupMember).where(GroupMember.group_id == group_id))
+    members = res.scalars().all()
+    result = []
+    for m in members:
+        ures = await db.execute(select(User).where(User.id == m.user_id))
+        u = ures.scalar_one_or_none()
+        if u:
+            result.append({
+                "id": u.id, "username": u.username, "email": u.email,
+                "ip": u.ip or "", "is_superuser": u.is_superuser,
+                "is_private": u.is_private,
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+                "role": m.role,
+            })
+    return result
