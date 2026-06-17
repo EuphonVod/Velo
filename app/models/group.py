@@ -48,3 +48,9 @@ class GroupBan(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), index=True)
     until: Mapped[datetime] = mapped_column(nullable=True)  # None = permanent
     created_at: Mapped[datetime] = mapped_column(default=datetime.now)
+
+class GroupBannedIP(Base):
+    __tablename__ = "group_banned_ip"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(index=True)
+    ip: Mapped[str] = mapped_column(index=True)

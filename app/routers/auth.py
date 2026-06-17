@@ -1,11 +1,12 @@
 import urllib
+from urllib import request
 
 from fastapi import APIRouter, Depends, HTTPException
 from app.schemas.user import UserCreate, UserResponse, UserLogin, Token, UserUpdate, PasswordChange, EmailChange, AccountDelete
 import bcrypt
 from app.database import AsyncSessionLocal
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.user import User
+from app.models.user import User, GlobalBannedIP
 from sqlalchemy import select, or_
 from app.dependencies import get_current_user
 import jwt
@@ -21,9 +22,10 @@ async def get_db():
         yield session
 
 
+from fastapi import Request
+
 @router.post("/register", response_model=UserResponse)
-async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
-    #verifier si username pas en doublons
+async def register(user: UserCreate, request: Request, db: AsyncSession = Depends(get_db)):
     existing = await db.execute(select(User).where(User.username == user.username))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Username already exists")
@@ -31,7 +33,14 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
     existing_email = await db.execute(select(User).where(User.email == user.email))
     if existing_email.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already exists")
-    public_ip = urllib.request.urlopen('https://ident.me').read().decode('utf8')
+
+    forwarded = request.headers.get("x-forwarded-for")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
+    banned = await db.execute(
+        select(GlobalBannedIP).where(GlobalBannedIP.ip == client_ip))
+    if banned.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
+
     password_bytes = user.password.encode("utf-8")
     salt = bcrypt.gensalt()
     hashed_password = bcrypt.hashpw(password_bytes, salt).decode("utf-8")
@@ -43,16 +52,22 @@ async def register(user: UserCreate, db: AsyncSession = Depends(get_db)):
         slug=user.username.lower(),
         bio="",
         avatar_url="",
-        ip=public_ip,
+        ip=client_ip,
     )
     db.add(user_db)
     await db.commit()
     await db.refresh(user_db)
     return user_db
 
-
 @router.post("/login", response_model=Token)
-async def login(user: UserLogin, db: AsyncSession = Depends(get_db)):
+async def login(user: UserLogin, request: Request, db: AsyncSession = Depends(get_db)):
+    forwarded = request.headers.get("x-forwarded-for")
+    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
+    banned = await db.execute(
+        select(GlobalBannedIP).where(GlobalBannedIP.ip == client_ip))
+    if banned.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Access denied")
+
     #accepte mail ou username via login
     identifier = (user.identifier or user.email or "").strip()
     result_user = await db.execute(

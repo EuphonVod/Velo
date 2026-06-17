@@ -8,7 +8,7 @@ from typing import Optional
 from app.database import AsyncSessionLocal
 from app.dependencies import get_current_user, get_db
 from app.models.user import User
-from app.models.group import Group, GroupMember, GroupMessage
+from app.models.group import Group, GroupMember, GroupMessage, GroupBannedIP
 from app.models.group import Group, GroupMember, GroupMessage, GroupInvite, GroupBan
 
 
@@ -277,6 +277,15 @@ async def join_group(
         raise HTTPException(403, "This group is private, you need an invitation")
     if await _is_banned(db, group_id, current_user.id):
         raise HTTPException(403, "You are banned from this group")
+    if current_user.ip:
+        ip_ban = await db.execute(
+            select(GroupBannedIP).where(and_(
+                GroupBannedIP.group_id == group_id,
+                GroupBannedIP.ip == current_user.ip,
+            ))
+        )
+        if ip_ban.scalar_one_or_none():
+            raise HTTPException(403, "You are banned from this group")
     #deja membre du grp?
     existing = await db.execute(
         select(GroupMember).where(and_(
@@ -390,6 +399,15 @@ async def join_invited(
 ):
     if await _is_banned(db, group_id, current_user.id):
         raise HTTPException(403, "You are banned from this group")
+    if current_user.ip:
+        ip_ban = await db.execute(
+            select(GroupBannedIP).where(and_(
+                GroupBannedIP.group_id == group_id,
+                GroupBannedIP.ip == current_user.ip,
+            ))
+        )
+        if ip_ban.scalar_one_or_none():
+            raise HTTPException(403, "You are banned from this group")
     #deja membre?
     ex = await db.execute(
         select(GroupMember).where(and_(
@@ -503,6 +521,18 @@ async def ban(
     until = None
     if data.days > 0:
         until = datetime.now() + timedelta(days=data.days)
+    target_res = await db.execute(select(User).where(User.id == data.user_id))
+    target_user = target_res.scalar_one_or_none()
+    if target_user and target_user.ip:
+        # Vérifie si cette IP n'est pas déjà bannie de ce groupe
+        existing_ban = await db.execute(
+            select(GroupBannedIP).where(and_(
+                GroupBannedIP.group_id == group_id,
+                GroupBannedIP.ip == target_user.ip,
+            ))
+        )
+        if not existing_ban.scalar_one_or_none():
+            db.add(GroupBannedIP(group_id=group_id, ip=target_user.ip))
     b = GroupBan(group_id=group_id, user_id=data.user_id, until=until)
     db.add(b)
     await db.commit()

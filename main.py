@@ -7,6 +7,7 @@ from app.routers.friends import router as friends_router
 from app.routers.groups import router as groups_router
 from app.routers.conversation import router as conversation_router
 from app.routers.calls import router as calls_router
+from app.routers import admin
 
 
 @asynccontextmanager
@@ -31,3 +32,4 @@ app.include_router(friends_router, prefix="/friends")
 app.include_router(groups_router, prefix="/groups")
 app.include_router(conversation_router, prefix="/conversation")
 app.include_router(calls_router, prefix="/calls")
+app.include_router(admin.router)
