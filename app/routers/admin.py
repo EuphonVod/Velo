@@ -11,7 +11,7 @@ from app.models.moderation import Report, AdminNote
 from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user
 from datetime import datetime
-from app.models.moderation import Warning
+from app.models.moderation import Warnings
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -507,7 +507,7 @@ async def admin_add_warning(
     db: AsyncSession = Depends(get_db),
 ):
     _require_admin(current_user)
-    db.add(Warning(user_id=data.user_id, reason=data.reason, severity=data.severity))
+    db.add(Warnings(user_id=data.user_id, reason=data.reason, severity=data.severity))
     await db.commit()
     return {"status": "ok"}
 
@@ -519,8 +519,8 @@ async def admin_get_warnings(
 ):
     _require_admin(current_user)
     res = await db.execute(
-        select(Warning).where(Warning.user_id == user_id)
-        .order_by(Warning.created_at.desc()))
+        select(Warnings).where(Warnings.user_id == user_id)
+        .order_by(Warnings.created_at.desc()))
     return [{"id": w.id, "reason": w.reason, "severity": w.severity,
              "at": w.created_at.isoformat() if w.created_at else ""}
             for w in res.scalars().all()]
@@ -535,6 +535,6 @@ async def admin_delete_warning(
     db: AsyncSession = Depends(get_db),
 ):
     _require_admin(current_user)
-    await db.execute(delete(Warning).where(Warning.id == data.warning_id))
+    await db.execute(delete(Warnings).where(Warnings.id == data.warning_id))
     await db.commit()
     return {"status": "ok"}
