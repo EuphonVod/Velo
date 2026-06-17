@@ -11,6 +11,7 @@ from app.models.moderation import Report, AdminNote
 from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user
 from datetime import datetime
+from app.models.moderation import Warning
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
