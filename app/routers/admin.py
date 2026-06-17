@@ -4,6 +4,7 @@ from sqlalchemy import select, delete
 from pydantic import BaseModel
 
 from app.dependencies import get_db
+from app.models.group import Group, GroupMember, GroupMessage
 from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user
 from datetime import datetime
@@ -86,7 +87,6 @@ async def admin_list_users(
     _require_admin(current_user)
     query = select(User)
     if q:
-        # Recherche par username (partiel) ou par id exact
         if q.isdigit():
             query = query.where(User.id == int(q))
         else:
@@ -102,3 +102,52 @@ async def admin_list_users(
         }
         for u in users
     ]
+
+@router.get("/groups")
+async def admin_list_groups(
+    q: str = "",
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    query = select(Group)
+    if q:
+        if q.isdigit():
+            query = query.where(Group.id == int(q))
+        else:
+            query = query.where(Group.name.ilike(f"%{q}%"))
+    res = await db.execute(query.order_by(Group.id))
+    groups = res.scalars().all()
+    result = []
+    for g in groups:
+        cnt = await db.execute(
+            select(GroupMember).where(GroupMember.group_id == g.id))
+        members = len(cnt.scalars().all())
+        result.append({
+            "id": g.id, "name": g.name,
+            "is_private": getattr(g, "is_private", False),
+            "members": members,
+        })
+    return result
+
+
+class AdminGroupAction(BaseModel):
+    group_id: int
+
+
+@router.post("/delete_group")
+async def admin_delete_group(
+    data: AdminGroupAction,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_admin(current_user)
+    res = await db.execute(select(Group).where(Group.id == data.group_id))
+    g = res.scalar_one_or_none()
+    if not g:
+        raise HTTPException(404, "Group not found")
+    await db.execute(delete(GroupMessage).where(GroupMessage.group_id == data.group_id))
+    await db.execute(delete(GroupMember).where(GroupMember.group_id == data.group_id))
+    await db.delete(g)
+    await db.commit()
+    return {"status": "deleted"}
