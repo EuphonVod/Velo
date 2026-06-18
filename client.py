@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from call_engine import CallEngine
+from countries import populate_country_combo
 
 def list_audio_devices():
     try:
@@ -1019,11 +1020,28 @@ class LoginDialog(QDialog):
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(sub)
         lo.addSpacing(28)
+        # Ligne : sélecteur de pays (drapeau + indicatif, recherchable) + numéro local
+        row = QHBoxLayout(); row.setSpacing(8)
+        self.country_combo = QComboBox()
+        self.country_combo.setFixedHeight(46)
+        self.country_combo.setStyleSheet(f"""
+            QComboBox {{background:{C['panel']};color:{C['text']};
+                border:1.5px solid {C['card']};border-radius:12px;padding:0 8px;
+                font-size:12px;font-family:'Segoe UI';}}
+            QComboBox:focus {{border:1.5px solid {C['accent']};}}
+            QComboBox::drop-down {{border:none;width:20px;}}
+            QComboBox QLineEdit {{background:transparent;color:{C['text']};border:none;}}
+            QComboBox QAbstractItemView {{background:{C['panel']};color:{C['text']};
+                selection-background-color:{C['accent']};border:1px solid {C['card']};
+                outline:none;}}""")
+        populate_country_combo(self.country_combo, "FR")
+        row.addWidget(self.country_combo, 2)
         self.phone_input = QLineEdit()
         self.phone_input.setPlaceholderText(tr("phone_number"))
         self.phone_input.setFixedHeight(46); self.phone_input.setStyleSheet(field(12))
         self.phone_input.returnPressed.connect(self._send_code)
-        lo.addWidget(self.phone_input)
+        row.addWidget(self.phone_input, 3)
+        lo.addLayout(row)
         lo.addSpacing(8)
         self.phone_err = QLabel(""); self.phone_err.setFont(QFont("Segoe UI", 11))
         self.phone_err.setWordWrap(True)
@@ -1111,13 +1129,16 @@ class LoginDialog(QDialog):
 
     def _send_code(self):
         self.phone_err.setText("")
-        phone = self.phone_input.text().strip()
-        if not phone:
+        dial = self.country_combo.currentData() or ""
+        # Retire le 0 national de tête (convention internationale : 06… -> +33 6…)
+        local = "".join(ch for ch in self.phone_input.text() if ch.isdigit()).lstrip("0")
+        if not local:
             self.phone_err.setText(tr("invalid_phone")); return
-        self.phone = phone
+        # Numéro complet = indicatif du pays + numéro local saisi
+        self.phone = dial + local
         if not self._request_code(self.phone_err):
             return
-        self.code_info.setText(tr("code_sent_to", phone=phone))
+        self.code_info.setText(tr("code_sent_to", phone=self.phone))
         self.code_input.clear(); self.code_err.setText("")
         self.stack.setCurrentIndex(1)
         self.code_input.setFocus()
