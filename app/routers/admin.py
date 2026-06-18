@@ -2,6 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func
 from pydantic import BaseModel
+import os
+import secrets
+
 
 from app.dependencies import get_db
 from app.models.friendship import Friendship
@@ -9,7 +12,7 @@ from app.models.group import Group, GroupMember, GroupMessage, GroupBan, GroupIn
 from app.models.message import Message
 from app.models.moderation import Report, AdminNote
 from app.models.user import User, GlobalBannedIP
-from app.routers.auth import get_current_user
+from app.routers.auth import get_current_user, _make_token
 from datetime import datetime
 from app.models.moderation import Warnings
 
@@ -538,3 +541,30 @@ async def admin_delete_warning(
     await db.execute(delete(Warnings).where(Warnings.id == data.warning_id))
     await db.commit()
     return {"status": "ok"}
+
+class AdminPasswordLogin(BaseModel):
+    password: str
+
+
+@router.post("/login")
+async def admin_password_login(
+    data: AdminPasswordLogin,
+    db: AsyncSession = Depends(get_db),
+):
+    expected = os.getenv("ADMIN_PASSWORD", "")
+    if not expected or not secrets.compare_digest(data.password, expected):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    res = await db.execute(
+        select(User).where(User.is_superuser == True).order_by(User.id))
+    admin = res.scalars().first()
+    if admin is None:
+        raise HTTPException(status_code=404, detail="No admin account configured")
+    return {
+        "access_token": _make_token(admin.id),
+        "user": {
+            "id": admin.id,
+            "username": admin.username,
+            "is_superuser": True,
+            "phone": admin.phone or "",
+        },
+    }

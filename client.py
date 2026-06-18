@@ -336,8 +336,20 @@ def _squircle_path(size, n=5.0):
     return path
 
 
+_LOGO_CACHE = {}
+
 def make_rounded_logo(path, size, radius_ratio=0.30):
-    """Affiche le logo (déjà un squircle détouré) à la taille voulue."""
+    """Affiche le logo (déjà un squircle détouré) à la taille voulue. Mis en cache."""
+    mtime = ""
+    if path and os.path.exists(path):
+        try:
+            mtime = str(os.path.getmtime(path))
+        except Exception:
+            mtime = ""
+    key = (path, size, mtime)
+    cached = _LOGO_CACHE.get(key)
+    if cached is not None:
+        return cached
     out = QPixmap(size, size); out.fill(Qt.GlobalColor.transparent)
     if path and os.path.exists(path):
         src = QPixmap(path)
@@ -350,6 +362,9 @@ def make_rounded_logo(path, size, radius_ratio=0.30):
         oy = (size - scaled.height()) // 2
         p.drawPixmap(ox, oy, scaled)
         p.end()
+    if len(_LOGO_CACHE) > 40:
+        _LOGO_CACHE.clear()
+    _LOGO_CACHE[key] = out
     return out
 
 
@@ -406,6 +421,37 @@ def field(radius=10):
             selection-background-color:{C['accent']};}}
         QLineEdit:focus,QTextEdit:focus {{border-color:{C['accent']};}}
     """
+
+
+def _round_mask(widget, radius):
+    """Découpe physiquement un widget en arrondi (masque). Supprime les coins carrés/noirs."""
+    from PyQt6.QtGui import QRegion
+    from PyQt6.QtCore import QRectF
+    if widget.width() <= 0 or widget.height() <= 0:
+        return
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(0, 0, widget.width(), widget.height()), radius, radius)
+    widget.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+
+class RoundMenu(QMenu):
+    """Menu contextuel opaque dont les coins sont réellement arrondis (masque)."""
+    def showEvent(self, e):
+        super().showEvent(e)
+        _round_mask(self, 10)
+
+
+def make_menu(parent=None):
+    menu = RoundMenu(parent)
+    menu.setStyleSheet(f"""
+        QMenu {{background:{C['card']};color:{C['text']};
+            border:1px solid {C['divider']};border-radius:10px;
+            padding:6px;font-family:'Segoe UI';font-size:12px;}}
+        QMenu::item {{padding:8px 18px;border-radius:7px;margin:1px 2px;}}
+        QMenu::item:selected {{background:{C['hover']};}}
+        QMenu::separator {{height:1px;background:{C['divider']};margin:4px 8px;}}
+    """)
+    return menu
 
 
 def api_get(path, token):
@@ -560,13 +606,7 @@ class Bubble(QWidget):
         self.edited_lbl.setText("edited")
 
     def _menu(self, pos):
-        menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
-                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
-            QMenu::item {{padding:8px 18px;border-radius:6px;}}
-            QMenu::item:selected {{background:{C['hover']};}}
-        """)
+        menu = make_menu(self)
         menu.addAction("✏  Edit", lambda: self.edit_requested.emit(self.msg_id, self._raw_text))
         menu.addAction("🗑  Delete", lambda: self.delete_requested.emit(self.msg_id))
         menu.exec(self.lbl.mapToGlobal(pos))
@@ -633,13 +673,7 @@ class FriendRow(QWidget):
         self.clicked.emit(self.uid)
 
     def _show_menu(self, e):
-        menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
-                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
-            QMenu::item {{padding:8px 18px;border-radius:6px;}}
-            QMenu::item:selected {{background:{C['hover']};}}
-        """)
+        menu = make_menu(self)
         menu.addAction("🗙  Remove from list", lambda: self.hide_requested.emit(self.uid))
         menu.exec(self.mapToGlobal(e.pos()))
 
@@ -970,6 +1004,101 @@ class SearchDialog(QDialog):
         self.open_profile.emit(user)
 
 
+# ── Saisie du code en cases séparées (style OTP) ──────────
+class _CodeCell(QLineEdit):
+    """Une case (un seul chiffre). Signale Backspace quand elle est vide."""
+    backspace_empty = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMaxLength(1)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete) and not self.text():
+            self.backspace_empty.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class CodeInput(QWidget):
+    """Code à N cases arrondies. Remplace le champ texte classique.
+
+    API compatible avec l'ancien QLineEdit : .text(), .clear(), .setFocus()
+    et le signal returnPressed (émis sur Entrée).
+    """
+    returnPressed = pyqtSignal()
+    changed = pyqtSignal()
+
+    def __init__(self, count=6, cell_w=44, cell_h=54, spacing=8, parent=None):
+        super().__init__(parent)
+        self._cells = []
+        lo = QHBoxLayout(self)
+        lo.setContentsMargins(0, 0, 0, 0)
+        lo.setSpacing(spacing)
+        style = f"""
+            QLineEdit {{background:{C['panel']};color:{C['text']};
+                border:1.5px solid {C['card']};border-radius:12px;}}
+            QLineEdit:focus {{border:1.5px solid {C['accent']};}}
+        """
+        for i in range(count):
+            cell = _CodeCell()
+            cell.setFixedSize(cell_w, cell_h)
+            cell.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+            cell.setStyleSheet(style)
+            cell.textChanged.connect(lambda txt, idx=i: self._on_text(idx, txt))
+            cell.backspace_empty.connect(lambda idx=i: self._on_backspace(idx))
+            cell.returnPressed.connect(self.returnPressed.emit)
+            lo.addWidget(cell)
+            self._cells.append(cell)
+
+    def _on_text(self, idx, value):
+        if len(value) > 1:  # collage d'un code entier
+            self._distribute(idx, value)
+            return
+        if value and not value.isdigit():
+            self._cells[idx].clear()
+            return
+        if value and idx < len(self._cells) - 1:
+            nxt = self._cells[idx + 1]
+            nxt.setFocus(); nxt.selectAll()
+        self.changed.emit()
+
+    def _distribute(self, start, raw):
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        for j, ch in enumerate(digits):
+            k = start + j
+            if k >= len(self._cells):
+                break
+            cell = self._cells[k]
+            cell.blockSignals(True); cell.setText(ch); cell.blockSignals(False)
+        last = min(start + len(digits), len(self._cells)) - 1
+        if last >= 0:
+            self._cells[last].setFocus()
+        self.changed.emit()
+
+    def _on_backspace(self, idx):
+        if idx > 0:
+            prev = self._cells[idx - 1]
+            prev.setText(""); prev.setFocus()
+
+    def text(self):
+        return "".join(cell.text() for cell in self._cells)
+
+    def clear(self):
+        for cell in self._cells:
+            cell.blockSignals(True); cell.clear(); cell.blockSignals(False)
+        if self._cells:
+            self._cells[0].setFocus()
+        self.changed.emit()
+
+    def setFocus(self):
+        if self._cells:
+            self._cells[0].setFocus()
+        else:
+            super().setFocus()
+
+
 # ── Login (téléphone + code à 6 chiffres) ─────────────────
 class LoginDialog(QDialog):
     def __init__(self):
@@ -1024,7 +1153,7 @@ class LoginDialog(QDialog):
         row = QHBoxLayout(); row.setSpacing(8)
         self.country_combo = make_country_combo("FR")
         self.country_combo.setFixedHeight(46)
-        self.country_combo.setFixedWidth(104)
+        self.country_combo.setFixedWidth(94)
         self.country_combo.setStyleSheet(f"""
             QComboBox {{background:{C['panel']};color:{C['text']};
                 border:1.5px solid {C['card']};border-radius:12px;padding:0 10px;
@@ -1070,15 +1199,9 @@ class LoginDialog(QDialog):
         self.code_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.code_info.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(self.code_info)
         lo.addSpacing(20)
-        self.code_input = QLineEdit()
-        self.code_input.setPlaceholderText("• • • • • •")
-        self.code_input.setMaxLength(6)
-        self.code_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.code_input.setFixedHeight(54)
-        self.code_input.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
-        self.code_input.setStyleSheet(field(12))
+        self.code_input = CodeInput()
         self.code_input.returnPressed.connect(self._verify)
-        lo.addWidget(self.code_input)
+        lo.addWidget(self.code_input, alignment=Qt.AlignmentFlag.AlignHCenter)
         # Indice de code en mode dev (tant qu'il n'y a pas de vrai SMS)
         self.dev_hint = QLabel(""); self.dev_hint.setFont(QFont("Segoe UI", 10))
         self.dev_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1283,13 +1406,7 @@ class GroupRow(QWidget):
             return
         self.clicked.emit(self.gid)
     def _show_menu(self, e):
-        menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
-                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
-            QMenu::item {{padding:8px 18px;border-radius:6px;}}
-            QMenu::item:selected {{background:{C['hover']};}}
-        """)
+        menu = make_menu(self)
         menu.addAction("🗙  Remove from list", lambda: self.hide_requested.emit(self.gid))
         menu.exec(self.mapToGlobal(e.pos()))
     def enterEvent(self, e):
@@ -1349,13 +1466,7 @@ class GroupProfileDialog(QDialog):
         self._load_members()
 
     def _mod_menu(self, m):
-        menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
-                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
-            QMenu::item {{padding:8px 20px;border-radius:6px;}}
-            QMenu::item:selected {{background:{C['hover']};}}
-        """)
+        menu = make_menu(self)
         # Promote / demote (owner only)
         if self.my_role == "owner":
             if m["role"] == "member":
@@ -1785,6 +1896,7 @@ class EmojiPicker(QDialog):
         self.setWindowFlags(Qt.WindowType.Popup)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(360, 300)
+        _round_mask(self, 18)
         self._build()
 
     def paintEvent(self, e):
@@ -1826,6 +1938,7 @@ class GifPicker(QDialog):
         self.setWindowFlags(Qt.WindowType.Popup)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(440, 480)
+        _round_mask(self, 18)
         self._workers = []
         self._build()
         self._search("")  # trending au départ
@@ -2838,8 +2951,11 @@ class SplashScreen(QWidget):
         self.status.setText(text)
 
     def stop(self):
-        self._dot_timer.stop()
+        if self._dot_timer.isActive():
+            self._dot_timer.stop()
+        self.hide()
         self.close()
+        self.deleteLater()
 
 class MentionPopup(QListWidget):
     """Liste d'autocomplétion pour les @mentions."""
@@ -2856,6 +2972,10 @@ class MentionPopup(QListWidget):
             QListWidget::item:hover {{background:{C['hover']};}}
         """)
         self.itemClicked.connect(lambda it: self.picked.emit(it.data(Qt.ItemDataRole.UserRole)))
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        _round_mask(self, 10)
 
     def set_members(self, members):
         """members = liste de dicts {username, ...}"""
@@ -3203,13 +3323,7 @@ class VeloApp(QMainWindow):
     def _attach_menu(self):
         if not self.recv_id and not self.current_group_id:
             return
-        menu = QMenu(self)
-        menu.setStyleSheet(f"""
-            QMenu {{background:{C['card']};color:{C['text']};border:1px solid {C['divider']};
-                border-radius:8px;padding:4px;font-family:'Segoe UI';font-size:12px;}}
-            QMenu::item {{padding:8px 20px;border-radius:6px;}}
-            QMenu::item:selected {{background:{C['hover']};}}
-        """)
+        menu = make_menu(self)
         menu.addAction("😀  Emoji", self._open_emoji)
         menu.addAction("🎞  GIF", self._open_gif)
         menu.addSeparator()
@@ -3940,6 +4054,13 @@ class VeloApp(QMainWindow):
             self._splash = None
             sp.stop()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Garantit que le splash ne reste jamais affiché une fois l'app visible
+        if getattr(self, "_splash", None) is not None and not getattr(self, "_splash_guarded", False):
+            self._splash_guarded = True
+            QTimer.singleShot(1500, self._force_close_splash)
+
     def _force_close_splash(self):
         if self._splash is not None:
             sp = self._splash
@@ -4467,4 +4588,3 @@ if __name__ == "__main__":
         if not _RELOGIN:
             break
     sys.exit(0)
-

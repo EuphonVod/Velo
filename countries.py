@@ -43,7 +43,6 @@ import sys
 
 
 def _flags_dir():
-    """Dossier des PNG de drapeaux, compatible exécutable PyInstaller."""
     if getattr(sys, "frozen", False):
         base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     else:
@@ -55,7 +54,6 @@ _icon_cache = {}
 
 
 def flag_icon(iso):
-    """QIcon du drapeau pour un code ISO (mis en cache). QIcon vide si absent."""
     from PyQt6.QtGui import QIcon
     key = iso.lower()
     if key not in _icon_cache:
@@ -65,23 +63,12 @@ def flag_icon(iso):
 
 
 def make_country_combo(default_iso="FR"):
-    """Crée le sélecteur de pays.
-
-    - Replié (compact)  : 'FR  +33'
-    - Déplié (liste)    : 'FR   France   +33'
-    On utilise le code ISO et non un drapeau emoji car Windows ne rend pas les
-    drapeaux emoji (la police système ne contient pas ces glyphes).
-    currentData() renvoie {'dial': '+33', 'compact': 'FR  +33'}.
-    Taper le code (ex. 'de') saute au pays correspondant.
-    """
     from PyQt6.QtWidgets import (
         QComboBox, QStyle, QStyleOptionComboBox, QStylePainter,
     )
-    from PyQt6.QtCore import QSize
+    from PyQt6.QtCore import QSize, QPoint
 
     class CountryCombo(QComboBox):
-        # Affiche le texte compact (juste l'indicatif) quand le menu est replié,
-        # le drapeau restant visible. La liste dépliée montre le nom complet.
         def paintEvent(self, event):
             p = QStylePainter(self)
             opt = QStyleOptionComboBox()
@@ -92,8 +79,19 @@ def make_country_combo(default_iso="FR"):
             p.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
             p.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
 
+        def showPopup(self):
+            super().showPopup()
+            popup = self.view().window()
+            below = self.mapToGlobal(QPoint(0, self.height()))
+            win = self.window()
+            win_bottom = win.mapToGlobal(QPoint(0, win.height())).y()
+            avail = max(80, win_bottom - below.y() - 6)
+            h = min(popup.height(), avail)
+            popup.setGeometry(below.x(), below.y(), popup.width(), h)
+
     combo = CountryCombo()
-    combo.setIconSize(QSize(24, 18))
+    combo.setIconSize(QSize(22, 16))
+    combo.setMaxVisibleItems(8)
     default_idx = 0
     for i, (name, iso, dial) in enumerate(sorted(COUNTRIES, key=lambda c: c[0])):
         combo.addItem(
@@ -103,7 +101,6 @@ def make_country_combo(default_iso="FR"):
         )
         if iso == default_iso:
             default_idx = i
-    # La liste déroulante est plus large que le sélecteur (replié compact).
-    combo.view().setMinimumWidth(250)
+    combo.view().setMinimumWidth(230)
     combo.setCurrentIndex(default_idx)
     return combo
