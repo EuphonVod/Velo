@@ -38,30 +38,72 @@ COUNTRIES = [
 ]
 
 
-def flag(iso: str) -> str:
-    iso = iso.upper()
-    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in iso if "A" <= c <= "Z")
+import os
+import sys
 
 
-def populate_country_combo(combo, default_iso="FR"):
-    from PyQt6.QtWidgets import QComboBox, QCompleter
-    from PyQt6.QtCore import Qt
+def _flags_dir():
+    """Dossier des PNG de drapeaux, compatible exécutable PyInstaller."""
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "assets", "flags")
 
+
+_icon_cache = {}
+
+
+def flag_icon(iso):
+    """QIcon du drapeau pour un code ISO (mis en cache). QIcon vide si absent."""
+    from PyQt6.QtGui import QIcon
+    key = iso.lower()
+    if key not in _icon_cache:
+        path = os.path.join(_flags_dir(), f"{key}.png")
+        _icon_cache[key] = QIcon(path) if os.path.exists(path) else QIcon()
+    return _icon_cache[key]
+
+
+def make_country_combo(default_iso="FR"):
+    """Crée le sélecteur de pays.
+
+    - Replié (compact)  : 'FR  +33'
+    - Déplié (liste)    : 'FR   France   +33'
+    On utilise le code ISO et non un drapeau emoji car Windows ne rend pas les
+    drapeaux emoji (la police système ne contient pas ces glyphes).
+    currentData() renvoie {'dial': '+33', 'compact': 'FR  +33'}.
+    Taper le code (ex. 'de') saute au pays correspondant.
+    """
+    from PyQt6.QtWidgets import (
+        QComboBox, QStyle, QStyleOptionComboBox, QStylePainter,
+    )
+    from PyQt6.QtCore import QSize
+
+    class CountryCombo(QComboBox):
+        # Affiche le texte compact (juste l'indicatif) quand le menu est replié,
+        # le drapeau restant visible. La liste dépliée montre le nom complet.
+        def paintEvent(self, event):
+            p = QStylePainter(self)
+            opt = QStyleOptionComboBox()
+            self.initStyleOption(opt)
+            data = self.currentData()
+            if data and "compact" in data:
+                opt.currentText = data["compact"]
+            p.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+            p.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt)
+
+    combo = CountryCombo()
+    combo.setIconSize(QSize(24, 18))
     default_idx = 0
     for i, (name, iso, dial) in enumerate(sorted(COUNTRIES, key=lambda c: c[0])):
-        combo.addItem(f"{flag(iso)}  {name}  +{dial}", f"+{dial}")
+        combo.addItem(
+            flag_icon(iso),
+            f"{name}   +{dial}",
+            {"dial": f"+{dial}", "compact": f"+{dial}"},
+        )
         if iso == default_iso:
             default_idx = i
-
-    combo.setEditable(True)
-    combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-    le = combo.lineEdit()
-    if le is not None:
-        le.setReadOnly(False)
-    comp = combo.completer()
-    if comp is not None:
-        comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        comp.setFilterMode(Qt.MatchFlag.MatchContains)
-        comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    # La liste déroulante est plus large que le sélecteur (replié compact).
+    combo.view().setMinimumWidth(250)
     combo.setCurrentIndex(default_idx)
     return combo
