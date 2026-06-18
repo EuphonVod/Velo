@@ -1,18 +1,6 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
-
-
-class UserCreate(BaseModel):
-    username: str
-    email: EmailStr
-    password: str
-
-
-class UserLogin(BaseModel):
-    identifier: Optional[str] = None  
-    email: Optional[str] = None
-    password: str
 
 
 class UserUpdate(BaseModel):
@@ -26,7 +14,6 @@ class UserUpdate(BaseModel):
 class UserResponse(BaseModel):
     id: int
     username: str
-    email: EmailStr
     bio: Optional[str] = ""
     avatar_url: Optional[str] = ""
     is_private: Optional[bool] = False
@@ -39,20 +26,36 @@ class UserResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class MeResponse(UserResponse):
+    # Le numéro n'est exposé que sur /auth/me (jamais sur les autres profils).
+    phone: Optional[str] = ""
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-class PasswordChange(BaseModel):
-    current_password: str
-    new_password: str
 
-class EmailChange(BaseModel):
-    new_email: EmailStr
-    password: str
+# ── Authentification par téléphone + code ──────────────────
+class PhoneRequest(BaseModel):
+    phone: str
+    purpose: str = "login"  # login | delete_account | nuke_messages
 
+
+class CodeVerify(BaseModel):
+    phone: str
+    code: str
+
+
+class ActionCodeRequest(BaseModel):
+    # Le numéro provient du compte connecté, on ne demande que le motif.
+    purpose: str
+
+
+# Actions sensibles : confirmées par un code reçu sur le téléphone.
 class AccountDelete(BaseModel):
-    password: str
+    code: str
+
 
 class NukeMessages(BaseModel):
-    password: str
+    code: str

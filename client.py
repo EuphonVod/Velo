@@ -723,6 +723,30 @@ class ProfileDialog(QDialog):
         lo.addLayout(self.status_box)
         self._refresh_action()
 
+        # Bouton "Signaler" (sauf sur son propre profil)
+        if self.user["id"] != self.me["id"]:
+            lo.addSpacing(6)
+            report = QPushButton("🚩 " + tr("report_user"))
+            report.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            report.setFixedHeight(38)
+            report.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['text3']};
+                border:none;font-size:12px;font-family:'Segoe UI';}}
+                QPushButton:hover{{color:{C['red']};}}""")
+            report.clicked.connect(self._report)
+            lo.addWidget(report)
+
+    def _report(self):
+        reason, ok = QInputDialog.getText(self, tr("report_user"),
+            tr("report_reason"))
+        if not ok or not reason.strip():
+            return
+        res = api_post("/admin/report", self.token,
+                       {"reported_user_id": self.user["id"], "reason": reason.strip()})
+        if res is not None:
+            QMessageBox.information(self, tr("report_user"), tr("report_sent"))
+        else:
+            QMessageBox.warning(self, tr("report_user"), "Failed.")
+
     def _refresh_action(self):
         while self.status_box.count():
             it = self.status_box.takeAt(0)
@@ -945,111 +969,209 @@ class SearchDialog(QDialog):
         self.open_profile.emit(user)
 
 
-# ── Login ─────────────────────────────────────────────────
+# ── Login (téléphone + code à 6 chiffres) ─────────────────
 class LoginDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Velo")
-        self.setFixedSize(420, 500)
+        self.setFixedSize(420, 520)
         self.setStyleSheet(f"background:{C['bg']};")
         self.token = None; self.user = None
+        self.phone = ""
+        self._resend_left = 0
+        self._resend_timer = QTimer(self)
+        self._resend_timer.timeout.connect(self._tick_resend)
         self._build()
+
     def _build(self):
-        lo = QVBoxLayout(self); lo.setContentsMargins(48, 50, 48, 40); lo.setSpacing(0)
-        lo.addStretch()
+        self.stack = QStackedWidget(self)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.stack)
+        self.stack.addWidget(self._phone_page())
+        self.stack.addWidget(self._code_page())
+        self.stack.setCurrentIndex(0)
+
+    def _logo(self, size=96):
         icon = QLabel()
         if os.path.exists(LOGO_PATH):
-            icon.setPixmap(make_rounded_logo(LOGO_PATH, 112))
+            icon.setPixmap(make_rounded_logo(LOGO_PATH, size + 8))
         else:
-            icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 52))
+            icon.setText("✈"); icon.setFont(QFont("Segoe UI Emoji", 46))
             icon.setStyleSheet(f"color:{C['accent']};")
-        icon.setFixedSize(104, 104)
+        icon.setFixedSize(size, size)
         icon.setScaledContents(True)
         icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lo.addWidget(icon, alignment=Qt.AlignmentFlag.AlignHCenter)
-        lo.addSpacing(32)
+        return icon
+
+    # Page 1 : saisie du numéro
+    def _phone_page(self):
+        page = QWidget()
+        lo = QVBoxLayout(page); lo.setContentsMargins(48, 46, 48, 40); lo.setSpacing(0)
+        lo.addStretch()
+        lo.addWidget(self._logo(), alignment=Qt.AlignmentFlag.AlignHCenter)
+        lo.addSpacing(26)
         t = QLabel("Velo"); t.setFont(QFont("Segoe UI", 27, QFont.Weight.Bold))
         t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
         lo.addWidget(t)
         lo.addSpacing(4)
-        sub = QLabel(tr("login_subtitle")); sub.setFont(QFont("Segoe UI", 12))
+        sub = QLabel(tr("phone_login_hint")); sub.setFont(QFont("Segoe UI", 12))
+        sub.setWordWrap(True)
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sub.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(sub)
-        lo.addSpacing(30)
-        self.email = QLineEdit()
-        self.email.setPlaceholderText(tr("email_or_username"))
-        self.email.setFixedHeight(46); self.email.setStyleSheet(field(12)); lo.addWidget(self.email)
-        lo.addSpacing(10)
-        self.pw = QLineEdit(); self.pw.setPlaceholderText(tr("password"))
-        self.pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pw.setFixedHeight(46); self.pw.setStyleSheet(field(12))
-        self.pw.returnPressed.connect(self._login); lo.addWidget(self.pw)
+        lo.addSpacing(28)
+        self.phone_input = QLineEdit()
+        self.phone_input.setPlaceholderText(tr("phone_number"))
+        self.phone_input.setFixedHeight(46); self.phone_input.setStyleSheet(field(12))
+        self.phone_input.returnPressed.connect(self._send_code)
+        lo.addWidget(self.phone_input)
         lo.addSpacing(8)
-        self.err = QLabel(""); self.err.setFont(QFont("Segoe UI", 11))
-        self.err.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.err.setStyleSheet(f"color:{C['red']};"); lo.addWidget(self.err)
+        self.phone_err = QLabel(""); self.phone_err.setFont(QFont("Segoe UI", 11))
+        self.phone_err.setWordWrap(True)
+        self.phone_err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.phone_err.setStyleSheet(f"color:{C['red']};"); lo.addWidget(self.phone_err)
         lo.addSpacing(6)
-        lb = btn(tr("log_in"), C["accent"], bold=True, font_size=14)
-        lb.setFixedHeight(48); lb.clicked.connect(self._login); lo.addWidget(lb)
+        self.send_btn = btn(tr("send_code"), C["accent"], bold=True, font_size=14)
+        self.send_btn.setFixedHeight(48); self.send_btn.clicked.connect(self._send_code)
+        lo.addWidget(self.send_btn)
+        lo.addStretch()
+        return page
+
+    # Page 2 : saisie du code
+    def _code_page(self):
+        page = QWidget()
+        lo = QVBoxLayout(page); lo.setContentsMargins(48, 46, 48, 40); lo.setSpacing(0)
+        lo.addStretch()
+        lo.addWidget(self._logo(72), alignment=Qt.AlignmentFlag.AlignHCenter)
+        lo.addSpacing(22)
+        t = QLabel(tr("enter_code")); t.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
+        t.setAlignment(Qt.AlignmentFlag.AlignCenter); t.setStyleSheet(f"color:{C['text']};")
+        lo.addWidget(t)
+        lo.addSpacing(6)
+        self.code_info = QLabel(""); self.code_info.setFont(QFont("Segoe UI", 11))
+        self.code_info.setWordWrap(True)
+        self.code_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.code_info.setStyleSheet(f"color:{C['text2']};"); lo.addWidget(self.code_info)
+        lo.addSpacing(20)
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("• • • • • •")
+        self.code_input.setMaxLength(6)
+        self.code_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.code_input.setFixedHeight(54)
+        self.code_input.setFont(QFont("Segoe UI", 20, QFont.Weight.Bold))
+        self.code_input.setStyleSheet(field(12))
+        self.code_input.returnPressed.connect(self._verify)
+        lo.addWidget(self.code_input)
+        # Indice de code en mode dev (tant qu'il n'y a pas de vrai SMS)
+        self.dev_hint = QLabel(""); self.dev_hint.setFont(QFont("Segoe UI", 10))
+        self.dev_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dev_hint.setStyleSheet(f"color:{C['text3']};"); lo.addWidget(self.dev_hint)
+        lo.addSpacing(4)
+        self.code_err = QLabel(""); self.code_err.setFont(QFont("Segoe UI", 11))
+        self.code_err.setWordWrap(True)
+        self.code_err.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.code_err.setStyleSheet(f"color:{C['red']};"); lo.addWidget(self.code_err)
+        lo.addSpacing(6)
+        self.verify_btn = btn(tr("verify"), C["accent"], bold=True, font_size=14)
+        self.verify_btn.setFixedHeight(48); self.verify_btn.clicked.connect(self._verify)
+        lo.addWidget(self.verify_btn)
         lo.addSpacing(10)
-        rb = QPushButton(tr("create_account")); rb.setFixedHeight(46)
-        rb.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        rb.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['accent']};
-            border:1.5px solid {C['accent']};border-radius:10px;font-size:13px;
-            font-weight:500;font-family:'Segoe UI';}}
-            QPushButton:hover{{background:{C['hover']};}}""")
-        rb.clicked.connect(lambda: RegisterDialog(self).exec())
-        lo.addWidget(rb); lo.addStretch()
-    def _login(self):
-        self.err.setText("")
-        try:
-            r = requests.post(f"{BASE_URL}/auth/login",
-                              json={"identifier": self.email.text().strip(), "password": self.pw.text()})
-            if r.status_code == 200:
-                self.token = r.json()["access_token"]
-                save_token(self.token)  # mémorise pour les prochaines ouvertures
-                self.user = api_get("/auth/me", self.token); self.accept()
-            else:
-                self.err.setText("Wrong email or password.")
-        except Exception:
-            self.err.setText("Cannot reach server.")
+        row = QHBoxLayout()
+        self.resend_btn = QPushButton(tr("resend_code"))
+        self.change_btn = QPushButton(tr("change_number"))
+        for b in (self.resend_btn, self.change_btn):
+            b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            b.setFixedHeight(36)
+            b.setStyleSheet(f"""QPushButton{{background:transparent;color:{C['accent']};
+                border:none;font-size:12px;font-weight:600;font-family:'Segoe UI';}}
+                QPushButton:hover{{color:{C['text']};}}
+                QPushButton:disabled{{color:{C['text3']};}}""")
+        self.resend_btn.clicked.connect(self._resend)
+        self.change_btn.clicked.connect(self._change_number)
+        row.addWidget(self.change_btn); row.addStretch(); row.addWidget(self.resend_btn)
+        lo.addLayout(row)
+        lo.addStretch()
+        return page
 
-
-class RegisterDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(tr("create_account"))
-        self.setFixedSize(380, 410)
-        self.setStyleSheet(f"background:{C['bg']};")
-        lo = QVBoxLayout(self); lo.setContentsMargins(36, 36, 36, 36); lo.setSpacing(10)
-        t = QLabel(tr("create_account")); t.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
-        t.setStyleSheet(f"color:{C['text']};margin-bottom:10px;"); lo.addWidget(t)
-        self.un = QLineEdit(); self.un.setPlaceholderText(tr("username"))
-        self.em = QLineEdit(); self.em.setPlaceholderText(tr("email_or_username"))
-        self.pw = QLineEdit(); self.pw.setPlaceholderText(tr("password"))
-        self.pw.setEchoMode(QLineEdit.EchoMode.Password)
-        for w in (self.un, self.em, self.pw):
-            w.setFixedHeight(44); w.setStyleSheet(field(10)); lo.addWidget(w)
-        self.msg = QLabel(""); self.msg.setFont(QFont("Segoe UI", 11))
-        self.msg.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.msg)
-        b = btn("Create", C["accent"], bold=True, font_size=14)
-        b.setFixedHeight(46); b.clicked.connect(self._submit); lo.addWidget(b); lo.addStretch()
-    def _submit(self):
+    # ── Actions ───────────────────────────────────────────
+    def _request_code(self, error_label):
+        """Demande/renvoie un code pour self.phone. Retourne True si OK."""
         try:
-            r = requests.post(f"{BASE_URL}/auth/register",
-                              json={"username": self.un.text().strip(),
-                                    "email": self.em.text().strip(),
-                                    "password": self.pw.text()})
-            if r.status_code == 200:
-                self.msg.setStyleSheet(f"color:{C['green']};")
-                self.msg.setText("✓ Account created! You can log in.")
-                QTimer.singleShot(1300, self.accept)
-            else:
-                self.msg.setStyleSheet(f"color:{C['red']};")
-                self.msg.setText("Username or email already taken.")
+            r = requests.post(f"{BASE_URL}/auth/request_code", json={"phone": self.phone})
         except Exception:
-            self.msg.setStyleSheet(f"color:{C['red']};")
-            self.msg.setText("Cannot reach server.")
+            error_label.setText(tr("server_unreachable")); return False
+        if r.status_code == 200:
+            dev = r.json().get("dev_code")
+            self.dev_hint.setText(f"Dev code: {dev}" if dev else "")
+            return True
+        if r.status_code == 403:
+            error_label.setText("Access denied.")
+        else:
+            error_label.setText(tr("invalid_phone"))
+        return False
+
+    def _send_code(self):
+        self.phone_err.setText("")
+        phone = self.phone_input.text().strip()
+        if not phone:
+            self.phone_err.setText(tr("invalid_phone")); return
+        self.phone = phone
+        if not self._request_code(self.phone_err):
+            return
+        self.code_info.setText(tr("code_sent_to", phone=phone))
+        self.code_input.clear(); self.code_err.setText("")
+        self.stack.setCurrentIndex(1)
+        self.code_input.setFocus()
+        self._start_resend_cooldown()
+
+    def _verify(self):
+        self.code_err.setText("")
+        code = self.code_input.text().strip()
+        if len(code) < 4:
+            self.code_err.setText(tr("invalid_code")); return
+        try:
+            r = requests.post(f"{BASE_URL}/auth/verify_code",
+                              json={"phone": self.phone, "code": code})
+        except Exception:
+            self.code_err.setText(tr("server_unreachable")); return
+        if r.status_code == 200:
+            self._resend_timer.stop()
+            self.token = r.json()["access_token"]
+            save_token(self.token)  # mémorise pour les prochaines ouvertures
+            self.user = api_get("/auth/me", self.token)
+            self.accept()
+        else:
+            self.code_err.setText(tr("invalid_code"))
+
+    def _resend(self):
+        if self._resend_left > 0:
+            return
+        self.code_err.setText("")
+        if self._request_code(self.code_err):
+            self._start_resend_cooldown()
+
+    def _change_number(self):
+        self._resend_timer.stop()
+        self.stack.setCurrentIndex(0)
+        self.phone_input.setFocus()
+
+    def _start_resend_cooldown(self):
+        self._resend_left = 30
+        self._update_resend_btn()
+        self._resend_timer.start(1000)
+
+    def _tick_resend(self):
+        self._resend_left -= 1
+        if self._resend_left <= 0:
+            self._resend_timer.stop()
+        self._update_resend_btn()
+
+    def _update_resend_btn(self):
+        if self._resend_left > 0:
+            self.resend_btn.setText(tr("resend_in", s=self._resend_left))
+            self.resend_btn.setEnabled(False)
+        else:
+            self.resend_btn.setText(tr("resend_code"))
+            self.resend_btn.setEnabled(True)
 
 class CreateGroupDialog(QDialog):
     created = pyqtSignal(dict)
@@ -2038,6 +2160,7 @@ class SettingsPage(QWidget):
         # Build category pages
         categories = [
             (tr("account"), "👤", self._page_account),
+            (tr("account_standing"), "🛡", self._page_standing),
             (tr("privacy"), "🔒", self._page_privacy),
             (tr("notifications"), "🔔", self._page_notifications),
             (tr("voice_video"), "🎙", self._page_voice),
@@ -2133,34 +2256,13 @@ class SettingsPage(QWidget):
         save = btn(tr("save_profile"), C["accent"], bold=True, font_size=13)
         save.setFixedHeight(46); save.clicked.connect(self._save_profile); lo.addWidget(save)
 
-        # Email
+        # Phone (lecture seule : identifiant de connexion)
         sep = QFrame(); sep.setFixedHeight(1); sep.setStyleSheet(f"background:{C['divider']};border:none;")
         lo.addSpacing(6); lo.addWidget(sep); lo.addSpacing(6)
-        lo.addWidget(self._section_label(tr("email")))
-        self.new_email = QLineEdit(); self.new_email.setPlaceholderText(tr("new_email"))
-        self.new_email.setFixedHeight(42); self.new_email.setStyleSheet(field()); lo.addWidget(self.new_email)
-        self.email_pw = QLineEdit(); self.email_pw.setPlaceholderText(tr("current_password"))
-        self.email_pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.email_pw.setFixedHeight(42); self.email_pw.setStyleSheet(field()); lo.addWidget(self.email_pw)
-        self.email_status = QLabel(""); self.email_status.setFont(QFont("Segoe UI", 10))
-        self.email_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.email_status)
-        eb = btn(tr("change_email"), C["card"], C["text"], font_size=12)
-        eb.setFixedHeight(42); eb.clicked.connect(self._change_email); lo.addWidget(eb)
-
-        # Password
-        sep2 = QFrame(); sep2.setFixedHeight(1); sep2.setStyleSheet(f"background:{C['divider']};border:none;")
-        lo.addSpacing(6); lo.addWidget(sep2); lo.addSpacing(6)
-        lo.addWidget(self._section_label(tr("password_caps")))
-        self.cur_pw = QLineEdit(); self.cur_pw.setPlaceholderText(tr("current_password"))
-        self.cur_pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.cur_pw.setFixedHeight(42); self.cur_pw.setStyleSheet(field()); lo.addWidget(self.cur_pw)
-        self.new_pw = QLineEdit(); self.new_pw.setPlaceholderText(tr("new_password"))
-        self.new_pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.new_pw.setFixedHeight(42); self.new_pw.setStyleSheet(field()); lo.addWidget(self.new_pw)
-        self.pw_status = QLabel(""); self.pw_status.setFont(QFont("Segoe UI", 10))
-        self.pw_status.setAlignment(Qt.AlignmentFlag.AlignCenter); lo.addWidget(self.pw_status)
-        pb = btn(tr("change_password"), C["card"], C["text"], font_size=12)
-        pb.setFixedHeight(42); pb.clicked.connect(self._change_password); lo.addWidget(pb)
+        lo.addWidget(self._section_label(tr("phone_caps")))
+        phone_field = QLineEdit(self.user.get("phone", "")); phone_field.setReadOnly(True)
+        phone_field.setFixedHeight(42); phone_field.setStyleSheet(field())
+        lo.addWidget(phone_field)
 
         # Danger zone
         sep3 = QFrame(); sep3.setFixedHeight(1); sep3.setStyleSheet(f"background:{C['divider']};border:none;")
@@ -2398,6 +2500,136 @@ class SettingsPage(QWidget):
         python = sys.executable
         os.execl(python, python, *sys.argv)
 
+    # ── Page: Account Standing ────────────────────────────
+    def _page_standing(self):
+        page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(14)
+        lo.addWidget(self._page_title(tr("account_standing")))
+
+        # Carte de statut (remplie après chargement)
+        self.standing_card = QWidget()
+        self.standing_card.setStyleSheet(f"background:{C['card']};border-radius:14px;")
+        sc = QVBoxLayout(self.standing_card)
+        sc.setContentsMargins(20, 20, 20, 20); sc.setSpacing(10)
+        self.standing_icon = QLabel("⏳")
+        self.standing_icon.setFont(QFont("Segoe UI", 34))
+        self.standing_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sc.addWidget(self.standing_icon)
+        self.standing_status = QLabel(tr("loading"))
+        self.standing_status.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        self.standing_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.standing_status.setStyleSheet(f"color:{C['text']};")
+        sc.addWidget(self.standing_status)
+        self.standing_desc = QLabel("")
+        self.standing_desc.setFont(QFont("Segoe UI", 11))
+        self.standing_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.standing_desc.setWordWrap(True)
+        self.standing_desc.setStyleSheet(f"color:{C['text2']};")
+        sc.addWidget(self.standing_desc)
+        lo.addWidget(self.standing_card)
+
+        # Section des avertissements
+        self.standing_warnings_label = QLabel("")
+        self.standing_warnings_label.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        self.standing_warnings_label.setStyleSheet(f"color:{C['text2']};letter-spacing:1px;")
+        lo.addWidget(self.standing_warnings_label)
+
+        self.standing_warnings_box = QVBoxLayout()
+        self.standing_warnings_box.setSpacing(8)
+        lo.addLayout(self.standing_warnings_box)
+        lo.addStretch()
+
+        # Charge le standing depuis le serveur
+        self._load_standing()
+        return page
+
+    def _load_standing(self):
+        def do():
+            return api_get("/auth/my_standing", self.token)
+        self._standing_worker = ApiWorker(do)
+        self._standing_worker.done.connect(self._on_standing_loaded)
+        self._standing_worker.start()
+
+    def _on_standing_loaded(self, data):
+        # Vide la liste (utile en cas de rechargement après une erreur)
+        while self.standing_warnings_box.count():
+            it = self.standing_warnings_box.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        if not data:
+            # État d'erreur : serveur injoignable
+            self.standing_icon.setText("📡")
+            self.standing_status.setText(tr("standing_error"))
+            self.standing_status.setStyleSheet(f"color:{C['red']};")
+            self.standing_desc.setText(tr("standing_error_desc"))
+            self.standing_warnings_label.setText("")
+            retry = QPushButton(tr("retry"))
+            retry.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            retry.setFixedHeight(38)
+            retry.setStyleSheet(f"""QPushButton{{background:{C['accent']};color:white;
+                border:none;border-radius:10px;font-size:13px;font-weight:bold;
+                font-family:'Segoe UI';}}""")
+            retry.clicked.connect(self._retry_standing)
+            self.standing_warnings_box.addWidget(retry)
+            return
+        status = data.get("status", "good")
+        total = data.get("total", 0)
+        warnings = data.get("warnings", [])
+        # Configure la carte selon le statut
+        if status == "good":
+            self.standing_icon.setText("✅")
+            self.standing_status.setText(tr("standing_good"))
+            self.standing_status.setStyleSheet(f"color:{C['green']};")
+            self.standing_desc.setText(tr("standing_good_desc"))
+        elif status == "warning":
+            self.standing_icon.setText("⚠️")
+            self.standing_status.setText(tr("standing_warning"))
+            self.standing_status.setStyleSheet(f"color:{C['orange']};")
+            self.standing_desc.setText(tr("standing_warning_desc"))
+        else:  # limited
+            self.standing_icon.setText("🛑")
+            self.standing_status.setText(tr("standing_limited"))
+            self.standing_status.setStyleSheet(f"color:{C['red']};")
+            self.standing_desc.setText(tr("standing_limited_desc"))
+        # Liste des avertissements
+        if warnings:
+            self.standing_warnings_label.setText(tr("your_warnings", n=total))
+            for w in warnings:
+                self.standing_warnings_box.addWidget(self._standing_warning_row(w))
+        else:
+            self.standing_warnings_label.setText("")
+
+    def _retry_standing(self):
+        # Remet la carte en état de chargement puis relance la requête
+        self.standing_icon.setText("⏳")
+        self.standing_status.setText(tr("loading"))
+        self.standing_status.setStyleSheet(f"color:{C['text']};")
+        self.standing_desc.setText("")
+        self._load_standing()
+
+    def _standing_warning_row(self, w):
+        row = QWidget()
+        row.setStyleSheet(f"background:{C['card']};border-radius:10px;")
+        rl = QVBoxLayout(row); rl.setContentsMargins(14, 10, 14, 10); rl.setSpacing(3)
+        head = QHBoxLayout()
+        sev = w.get("severity", "warning")
+        badge = QLabel(tr("severe") if sev == "severe" else tr("warning_label"))
+        badge.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        bc = C["red"] if sev == "severe" else C["orange"]
+        badge.setStyleSheet(f"color:white;background:{bc};border-radius:5px;padding:2px 8px;")
+        head.addWidget(badge)
+        head.addStretch()
+        at = QLabel((w.get("at") or "")[:10])
+        at.setFont(QFont("Segoe UI", 9))
+        at.setStyleSheet(f"color:{C['text3']};background:transparent;")
+        head.addWidget(at)
+        rl.addLayout(head)
+        reason = QLabel(w.get("reason", ""))
+        reason.setWordWrap(True)
+        reason.setFont(QFont("Segoe UI", 11))
+        reason.setStyleSheet(f"color:{C['text']};background:transparent;")
+        rl.addWidget(reason)
+        return row
+
     # ── Page: About ───────────────────────────────────────
     def _page_about(self):
         page = QWidget(); lo = QVBoxLayout(page); lo.setContentsMargins(0, 0, 0, 0); lo.setSpacing(12)
@@ -2468,101 +2700,74 @@ class SettingsPage(QWidget):
             self.voice_status.setStyleSheet(f"color:{C['green']};")
             self.voice_status.setText("✓ Audio devices saved")
 
-    def _change_email(self):
-        new_email = self.new_email.text().strip()
-        pw = self.email_pw.text()
-        if not new_email or not pw:
-            self.email_status.setStyleSheet(f"color:{C['red']};")
-            self.email_status.setText("Fill both fields.")
-            return
+    def _confirm_with_code(self, title, purpose):
+        """Demande un code de confirmation au serveur puis le fait saisir.
+        Retourne le code saisi (str) ou None si annulé / erreur."""
         try:
-            r = requests.post(f"{BASE_URL}/auth/change_email",
-                              json={"new_email": new_email, "password": pw}, headers=H(self.token))
-            if r.status_code == 200:
-                self.email_status.setStyleSheet(f"color:{C['green']};")
-                self.email_status.setText("✓ Email changed")
-                self.new_email.clear(); self.email_pw.clear()
-            elif r.status_code == 401:
-                self.email_status.setStyleSheet(f"color:{C['red']};")
-                self.email_status.setText("Wrong password.")
-            elif r.status_code == 400:
-                self.email_status.setStyleSheet(f"color:{C['red']};")
-                self.email_status.setText("Email already in use.")
-            else:
-                self.email_status.setStyleSheet(f"color:{C['red']};")
-                self.email_status.setText("Failed.")
+            r = requests.post(f"{BASE_URL}/auth/request_action_code",
+                              json={"purpose": purpose}, headers=H(self.token))
         except Exception:
-            self.email_status.setStyleSheet(f"color:{C['red']};")
-            self.email_status.setText("Cannot reach server.")
-
-    def _change_password(self):
-        cur = self.cur_pw.text(); new = self.new_pw.text()
-        if not cur or not new:
-            self.pw_status.setStyleSheet(f"color:{C['red']};")
-            self.pw_status.setText("Fill both fields.")
-            return
-        try:
-            r = requests.post(f"{BASE_URL}/auth/change_password",
-                              json={"current_password": cur, "new_password": new}, headers=H(self.token))
-            if r.status_code == 200:
-                self.pw_status.setStyleSheet(f"color:{C['green']};")
-                self.pw_status.setText("✓ Password changed")
-                self.cur_pw.clear(); self.new_pw.clear()
-            elif r.status_code == 401:
-                self.pw_status.setStyleSheet(f"color:{C['red']};")
-                self.pw_status.setText("Wrong current password.")
-            else:
-                self.pw_status.setStyleSheet(f"color:{C['red']};")
-                self.pw_status.setText("Failed.")
-        except Exception:
-            self.pw_status.setStyleSheet(f"color:{C['red']};")
-            self.pw_status.setText("Cannot reach server.")
+            QMessageBox.warning(self, title, tr("server_unreachable"))
+            return None
+        if r.status_code != 200:
+            QMessageBox.warning(self, title, tr("server_unreachable"))
+            return None
+        # Indice du code en mode dev (pas de vrai SMS pour l'instant)
+        dev = r.json().get("dev_code")
+        prompt = tr("confirm_code_prompt")
+        if dev:
+            prompt += f"\n\nDev code: {dev}"
+        code, ok = QInputDialog.getText(self, title, prompt)
+        if not ok or not code.strip():
+            return None
+        return code.strip()
 
     def _delete_account(self):
-        pw, ok = QInputDialog.getText(self, "Delete account",
-            "This is permanent. Enter your password to confirm:",
-            echo=QLineEdit.EchoMode.Password)
-        if not ok or not pw:
+        confirm = QMessageBox.question(self, tr("delete_account"),
+            "This is permanent. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        code = self._confirm_with_code(tr("delete_account"), "delete_account")
+        if code is None:
             return
         try:
             r = requests.post(f"{BASE_URL}/auth/delete_account",
-                              json={"password": pw}, headers=H(self.token))
+                              json={"code": code}, headers=H(self.token))
             if r.status_code == 200:
                 self.account_deleted.emit()
             elif r.status_code == 401:
-                QMessageBox.warning(self, "Delete account", "Wrong password.")
+                QMessageBox.warning(self, tr("delete_account"), tr("invalid_code"))
             else:
-                QMessageBox.warning(self, "Delete account", "Failed to delete account.")
+                QMessageBox.warning(self, tr("delete_account"), "Failed to delete account.")
         except Exception:
-            QMessageBox.warning(self, "Delete account", "Cannot reach server.")
+            QMessageBox.warning(self, tr("delete_account"), tr("server_unreachable"))
 
     def _nuke_messages(self):
         #confirmation dabord
-        confirm = QMessageBox.question(self, "Delete all messages",
+        confirm = QMessageBox.question(self, tr("delete_all_messages"),
             "This will permanently delete ALL messages you've sent "
             "(direct messages and group messages). This cannot be undone.\n\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        #mdp en confirmation
-        pw, ok = QInputDialog.getText(self, "Delete all messages",
-            "Enter your password to confirm:",
-            echo=QLineEdit.EchoMode.Password)
-        if not ok or not pw:
+        # Confirmation par code SMS
+        code = self._confirm_with_code(tr("delete_all_messages"), "nuke_messages")
+        if code is None:
             return
         try:
             r = requests.post(f"{BASE_URL}/chat/nuke_messages",
-                              json={"password": pw}, headers=H(self.token))
+                              json={"code": code}, headers=H(self.token))
             if r.status_code == 200:
                 n = r.json().get("deleted", 0)
-                QMessageBox.information(self, "Delete all messages",
+                QMessageBox.information(self, tr("delete_all_messages"),
                     f"✓ {n} message(s) deleted.")
             elif r.status_code == 401:
-                QMessageBox.warning(self, "Delete all messages", "Wrong password.")
+                QMessageBox.warning(self, tr("delete_all_messages"), tr("invalid_code"))
             else:
-                QMessageBox.warning(self, "Delete all messages", "Failed.")
+                QMessageBox.warning(self, tr("delete_all_messages"), "Failed.")
         except Exception:
-            QMessageBox.warning(self, "Delete all messages", "Cannot reach server.")
+            QMessageBox.warning(self, tr("delete_all_messages"), tr("server_unreachable"))
 
 
 # ── Main window ───────────────────────────────────────────
@@ -4241,3 +4446,4 @@ if __name__ == "__main__":
         if not _RELOGIN:
             break
     sys.exit(0)
+

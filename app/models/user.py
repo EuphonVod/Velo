@@ -10,8 +10,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True, index=True)
     username: Mapped[str] = mapped_column(index=True, unique=True)
     slug: Mapped[str] = mapped_column(index=True, unique=True)
-    email: Mapped[str] = mapped_column(index=True, unique=True)
-    hashed_password: Mapped[str]
+    phone: Mapped[str] = mapped_column(index=True, unique=True)
     is_superuser: Mapped[bool] = mapped_column(default=False)
     bio: Mapped[str] = mapped_column(Text, default="", nullable=True)
     avatar_url: Mapped[str] = mapped_column(default="", nullable=True)

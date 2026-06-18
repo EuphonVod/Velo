@@ -1,4 +1,3 @@
-import bcrypt
 from fastapi import APIRouter, WebSocket, Depends
 from sqlalchemy import or_, select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +21,7 @@ from fastapi import UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
 
 from app.schemas.user import NukeMessages
+from app.codes import verify_code
 
 router = APIRouter()
 
@@ -235,12 +235,9 @@ async def nuke_messages(
         current_user=Depends(get_current_user),
 ):
     my_id = current_user.id
-    #verifie mdp avant
-    result = await db.execute(select(User).where(User.id == my_id))
-    user_db = result.scalar_one_or_none()
-    if not bcrypt.checkpw(data.password.encode("utf-8"),
-                          user_db.hashed_password.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Wrong password")
+    # Confirmation par code reçu sur le téléphone
+    if not await verify_code(db, current_user.phone, data.code, purpose="nuke_messages"):
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     # Suppression en masse : DM + messages de groupe
     dm = await db.execute(delete(Message).where(Message.sender_id == my_id))
     gm = await db.execute(delete(GroupMessage).where(GroupMessage.sender_id == my_id))

@@ -7,9 +7,8 @@ import jwt
 import os
 
 from app.database import AsyncSessionLocal
-from app.schemas.user import UserCreate
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/verify_code")
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session

@@ -1,19 +1,20 @@
-import urllib
-from urllib import request
-
-from fastapi import APIRouter, Depends, HTTPException
-from app.schemas.user import UserCreate, UserResponse, UserLogin, Token, UserUpdate, PasswordChange, EmailChange, AccountDelete
-import bcrypt
-from app.database import AsyncSessionLocal
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.models.user import User, GlobalBannedIP
-from sqlalchemy import select, or_
-from app.dependencies import get_current_user
-import jwt
 import os
+import random
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import AsyncSessionLocal
+from app.dependencies import get_current_user
+from app.codes import create_code, verify_code
+from app.models.user import User, GlobalBannedIP
 from app.models.moderation import Warnings
-
-
+from app.schemas.user import (
+    UserResponse, MeResponse, UserUpdate, Token,
+    PhoneRequest, CodeVerify, AccountDelete, ActionCodeRequest,
+)
 
 router = APIRouter()
 
@@ -23,86 +24,97 @@ async def get_db():
         yield session
 
 
-from fastapi import Request
-
-@router.post("/register", response_model=UserResponse)
-async def register(user: UserCreate, request: Request, db: AsyncSession = Depends(get_db)):
-    existing = await db.execute(select(User).where(User.username == user.username))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Username already exists")
-
-    existing_email = await db.execute(select(User).where(User.email == user.email))
-    if existing_email.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Email already exists")
-
+def _client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
-    banned = await db.execute(
-        select(GlobalBannedIP).where(GlobalBannedIP.ip == client_ip))
+    return forwarded.split(",")[0].strip() if forwarded else request.client.host
+
+
+def _normalize_phone(phone: str) -> str:
+    # Retire tous les séparateurs courants (espaces, tirets, points, parenthèses…)
+    raw = (phone or "").strip()
+    plus = raw.startswith("+")
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not (6 <= len(digits) <= 15):
+        raise HTTPException(status_code=400, detail="Invalid phone number")
+    # Format canonique : on garde le '+' initial s'il y était.
+    return ("+" + digits) if plus else digits
+
+
+async def _generate_username(db: AsyncSession) -> str:
+    """Username par défaut du type user12345, modifiable ensuite dans les réglages."""
+    while True:
+        candidate = f"user{random.randint(1000, 999999)}"
+        existing = await db.execute(select(User).where(User.slug == candidate))
+        if existing.scalar_one_or_none() is None:
+            return candidate
+
+
+def _make_token(user_id: int) -> str:
+    return jwt.encode({"user_id": user_id}, os.getenv("SECRET_KEY"), algorithm="HS256")
+
+
+# ── Connexion par téléphone + code ─────────────────────────
+@router.post("/request_code")
+async def request_code(data: PhoneRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    """Étape 1 : l'utilisateur saisit son numéro, on lui envoie un code."""
+    phone = _normalize_phone(data.phone)
+    client_ip = _client_ip(request)
+    banned = await db.execute(select(GlobalBannedIP).where(GlobalBannedIP.ip == client_ip))
     if banned.scalar_one_or_none():
         raise HTTPException(status_code=403, detail="Access denied")
 
-    password_bytes = user.password.encode("utf-8")
-    salt = bcrypt.gensalt()
-    hashed_password = bcrypt.hashpw(password_bytes, salt).decode("utf-8")
+    code = await create_code(db, phone, purpose="login")
+    # dev_code : renvoyé tant qu'il n'y a pas de vrai SMS, pour tester l'UI.
+    return {"status": "ok", "dev_code": code}
 
-    user_db = User(
-        username=user.username,
-        email=user.email,
-        hashed_password=hashed_password,
-        slug=user.username.lower(),
-        bio="",
-        avatar_url="",
-        ip=client_ip,
-    )
-    db.add(user_db)
-    await db.commit()
-    await db.refresh(user_db)
-    return user_db
 
-@router.post("/login", response_model=Token)
-async def login(user: UserLogin, request: Request, db: AsyncSession = Depends(get_db)):
-    forwarded = request.headers.get("x-forwarded-for")
-    client_ip = forwarded.split(",")[0].strip() if forwarded else request.client.host
-    banned = await db.execute(
-        select(GlobalBannedIP).where(GlobalBannedIP.ip == client_ip))
-    if banned.scalar_one_or_none():
-        raise HTTPException(status_code=403, detail="Access denied")
+@router.post("/verify_code", response_model=Token)
+async def verify_code_route(data: CodeVerify, request: Request, db: AsyncSession = Depends(get_db)):
+    """Étape 2 : vérifie le code. Crée le compte si le numéro est nouveau."""
+    phone = _normalize_phone(data.phone)
+    if not await verify_code(db, phone, data.code, purpose="login"):
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
 
-    #accepte mail ou username via login
-    identifier = (user.identifier or user.email or "").strip()
-    result_user = await db.execute(
-        select(User).where(
-            or_(User.email == identifier, User.slug == identifier.lower())
+    result = await db.execute(select(User).where(User.phone == phone))
+    user = result.scalar_one_or_none()
+
+    if user is None:
+        username = await _generate_username(db)
+        user = User(
+            username=username,
+            slug=username,
+            phone=phone,
+            bio="",
+            avatar_url="",
+            ip=_client_ip(request),
         )
-    )
-    db_user = result_user.scalar_one_or_none()
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
 
-    if db_user is None:
-        raise HTTPException(status_code=404, detail="Unknown")
-
-    password_ok = bcrypt.checkpw(
-        user.password.encode("utf-8"),
-        db_user.hashed_password.encode("utf-8")
-    )
-    if not password_ok:
-        raise HTTPException(status_code=401, detail="Wrong password")
-
-    SECRET_KEY = os.getenv("SECRET_KEY")
-    token = jwt.encode(
-        {"user_id": db_user.id},
-        SECRET_KEY,
-        algorithm="HS256"
-    )
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": _make_token(user.id), "token_type": "bearer"}
 
 
-@router.get("/me", response_model=UserResponse)
+@router.post("/request_action_code")
+async def request_action_code(
+    data: ActionCodeRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Code de confirmation pour une action sensible (suppression, etc.)."""
+    if data.purpose not in ("delete_account", "nuke_messages"):
+        raise HTTPException(status_code=400, detail="Invalid purpose")
+    code = await create_code(db, current_user.phone, purpose=data.purpose)
+    return {"status": "ok", "dev_code": code}
+
+
+# ── Profil ─────────────────────────────────────────────────
+@router.get("/me", response_model=MeResponse)
 async def me(current_user: User = Depends(get_current_user)):
     return current_user
 
 
-@router.patch("/me", response_model=UserResponse)
+@router.patch("/me", response_model=MeResponse)
 async def update_me(
         data: UserUpdate,
         current_user: User = Depends(get_current_user),
@@ -111,18 +123,22 @@ async def update_me(
     result = await db.execute(select(User).where(User.id == current_user.id))
     user_db = result.scalar_one_or_none()
 
+    if data.username is not None:
+        new_slug = data.username.strip().lower()
+        if new_slug != user_db.slug:
+            taken = await db.execute(select(User).where(User.slug == new_slug))
+            if taken.scalar_one_or_none() is not None:
+                raise HTTPException(status_code=400, detail="Username already taken")
+        user_db.username = data.username.strip()
+        user_db.slug = new_slug
     if data.bio is not None:
         user_db.bio = data.bio
     if data.avatar_url is not None:
         user_db.avatar_url = data.avatar_url
-    if data.username is not None:
-        user_db.username = data.username
-        user_db.slug = data.username.lower()
     if data.is_private is not None:
         user_db.is_private = data.is_private
     if data.show_online is not None:
         user_db.show_online = data.show_online
-
 
     await db.commit()
     await db.refresh(user_db)
@@ -143,44 +159,6 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
-@router.post("/change_password")
-async def change_password(
-    data: PasswordChange,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(User).where(User.id == current_user.id))
-    user_db = result.scalar_one_or_none()
-    #verifier old mdp
-    if not bcrypt.checkpw(data.current_password.encode("utf-8"),
-                          user_db.hashed_password.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Wrong current password")
-    #defini nv mdp
-    salt = bcrypt.gensalt()
-    user_db.hashed_password = bcrypt.hashpw(data.new_password.encode("utf-8"), salt).decode("utf-8")
-    await db.commit()
-    return {"status": "ok"}
-
-
-@router.post("/change_email")
-async def change_email(
-    data: EmailChange,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    result = await db.execute(select(User).where(User.id == current_user.id))
-    user_db = result.scalar_one_or_none()
-    if not bcrypt.checkpw(data.password.encode("utf-8"),
-                          user_db.hashed_password.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Wrong password")
-    #verifier email doublons
-    existing = await db.execute(select(User).where(User.email == data.new_email))
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Email already in use")
-    user_db.email = data.new_email
-    await db.commit()
-    return {"status": "ok"}
-
 
 @router.post("/delete_account")
 async def delete_account(
@@ -188,11 +166,10 @@ async def delete_account(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if not await verify_code(db, current_user.phone, data.code, purpose="delete_account"):
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     result = await db.execute(select(User).where(User.id == current_user.id))
     user_db = result.scalar_one_or_none()
-    if not bcrypt.checkpw(data.password.encode("utf-8"),
-                          user_db.hashed_password.encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Wrong password")
     await db.delete(user_db)
     await db.commit()
     return {"status": "ok"}
@@ -225,4 +202,3 @@ async def my_standing(
             for w in warnings
         ],
     }
-

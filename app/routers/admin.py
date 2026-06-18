@@ -84,7 +84,7 @@ async def admin_ban_user(
 class AdminUserView(BaseModel):
     id: int
     username: str
-    email: str
+    phone: str | None = ""
     ip: str | None = ""
     is_superuser: bool = False
     is_private: bool = False
@@ -110,7 +110,7 @@ async def admin_list_users(
     users = res.scalars().all()
     return [
         {
-            "id": u.id, "username": u.username, "email": u.email,
+            "id": u.id, "username": u.username, "phone": u.phone,
             "ip": u.ip or "", "is_superuser": u.is_superuser,
             "is_private": u.is_private,
             "created_at": u.created_at.isoformat() if u.created_at else None,
@@ -187,7 +187,7 @@ async def admin_group_members(
         u = ures.scalar_one_or_none()
         if u:
             result.append({
-                "id": u.id, "username": u.username, "email": u.email,
+                "id": u.id, "username": u.username, "phone": u.phone,
                 "ip": u.ip or "", "is_superuser": u.is_superuser,
                 "is_private": u.is_private,
                 "created_at": u.created_at.isoformat() if u.created_at else None,
@@ -209,7 +209,7 @@ async def admin_alt_accounts(
     others = await db.execute(
         select(User).where(User.ip == target.ip, User.id != user_id).order_by(User.id))
     return [
-        {"id": u.id, "username": u.username, "email": u.email,
+        {"id": u.id, "username": u.username, "phone": u.phone,
          "ip": u.ip or "", "is_superuser": u.is_superuser,
          "is_private": u.is_private,
          "created_at": u.created_at.isoformat() if u.created_at else None}
@@ -313,7 +313,7 @@ async def admin_search_messages(
     if not q or len(q) < 2:
         return []
     results = []
-    # DM contenant le mot-clé
+    #dm avec mot clé
     dm = await db.execute(
         select(Message).where(Message.content.ilike(f"%{q}%"))
         .order_by(Message.created_at.desc()).limit(40))
@@ -325,7 +325,7 @@ async def admin_search_messages(
                         "sender": su.username if su else f"#{m.sender_id}",
                         "sender_id": m.sender_id,
                         "at": m.created_at.isoformat() if m.created_at else ""})
-    # Messages de groupe
+    #msg de grp
     gm = await db.execute(
         select(GroupMessage).where(GroupMessage.content.ilike(f"%{q}%"))
         .order_by(GroupMessage.created_at.desc()).limit(40))
@@ -343,7 +343,7 @@ async def admin_search_messages(
 
 class DeleteMsg(BaseModel):
     msg_id: int
-    kind: str  # "dm" ou "group"
+    kind: str  #dm ou grp
 
 @router.post("/delete_message")
 async def admin_delete_message(
@@ -363,7 +363,7 @@ class CreateReport(BaseModel):
     reported_user_id: int
     reason: str
 
-# Route appelée par le CLIENT (pas admin) pour signaler quelqu'un
+#route called par clien
 @router.post("/report")
 async def create_report(
     data: CreateReport,
@@ -419,7 +419,7 @@ async def admin_group_bans(
 ):
     _require_admin(current_user)
     out = []
-    # Bans par user
+    #bans par user
     res = await db.execute(select(GroupBan).where(GroupBan.group_id == group_id))
     for b in res.scalars().all():
         u = await db.execute(select(User).where(User.id == b.user_id))
@@ -427,7 +427,7 @@ async def admin_group_bans(
         out.append({"kind": "user", "ban_id": b.id,
                     "label": uu.username if uu else f"#{b.user_id}",
                     "until": b.until.isoformat() if b.until else "permanent"})
-    # Bans par IP
+    #bans par IP
     res2 = await db.execute(select(GroupBannedIP).where(GroupBannedIP.group_id == group_id))
     for b in res2.scalars().all():
         out.append({"kind": "ip", "ban_id": b.id, "label": b.ip, "until": "permanent"})
@@ -436,7 +436,7 @@ async def admin_group_bans(
 
 class GroupUnban(BaseModel):
     ban_id: int
-    kind: str  # "user" ou "ip"
+    kind: str  #user ou ip
 
 @router.post("/group_unban")
 async def admin_group_unban(
@@ -498,7 +498,7 @@ async def admin_delete_note(
 class AddWarning(BaseModel):
     user_id: int
     reason: str
-    severity: str = "warning"  # "warning" ou "severe"
+    severity: str = "warning"  #warning ou severe
 
 @router.post("/add_warning")
 async def admin_add_warning(
