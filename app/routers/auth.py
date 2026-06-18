@@ -11,7 +11,7 @@ from sqlalchemy import select, or_
 from app.dependencies import get_current_user
 import jwt
 import os
-from app.models.moderation import Warning
+from app.models.moderation import Warnings
 
 
 
@@ -204,8 +204,8 @@ async def my_standing(
     db: AsyncSession = Depends(get_db),
 ):
     res = await db.execute(
-        select(Warning).where(Warning.user_id == current_user.id)
-        .order_by(Warning.created_at.desc()))
+        select(Warnings).where(Warnings.user_id == current_user.id)
+        .order_by(Warnings.created_at.desc()))
     warnings = res.scalars().all()
     severe = sum(1 for w in warnings if w.severity == "severe")
     total = len(warnings)
