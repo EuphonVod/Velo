@@ -15,7 +15,7 @@ from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user, _make_token
 from datetime import datetime
 from app.models.moderation import Warnings
-from limiter import limiter
+from app.limiter import limiter
 from app.audit import record
 from app.models.audit import AuditLog
 
