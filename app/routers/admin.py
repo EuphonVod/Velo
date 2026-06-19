@@ -287,7 +287,7 @@ async def admin_set_admin(
     await db.commit()
     await record(db, current_user.id, "set_admin", data.user_id,
                  f"make_admin={data.make_admin}")
-    return {"status": "ok", "is_superuser": target.is_superuser}
+    return {"status": "ok", "is_superuser": data.make_admin}
 
 @router.get("/user_messages")
 async def admin_user_messages(
@@ -585,14 +585,17 @@ async def admin_password_login(
         raise HTTPException(status_code=404, detail="No admin account configured")
     fwd = request.headers.get("x-forwarded-for")
     ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")
-    await record(db, admin.id, "admin_login", admin.id, f"ip={ip}")
+    admin_id = admin.id
+    admin_username = admin.username
+    admin_phone = admin.phone or ""
+    await record(db, admin_id, "admin_login", admin_id, f"ip={ip}")
     return {
-        "access_token": _make_token(admin.id),
+        "access_token": _make_token(admin_id),
         "user": {
-            "id": admin.id,
-            "username": admin.username,
+            "id": admin_id,
+            "username": admin_username,
             "is_superuser": True,
-            "phone": admin.phone or "",
+            "phone": admin_phone,
         },
     }
 

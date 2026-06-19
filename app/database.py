@@ -15,7 +15,6 @@ from app.models.verification import PhoneCode
 from app.models.moderation import Warnings, Report, AdminNote
 from app.models.audit import AuditLog
 
-
 #load la file en .env
 load_dotenv()
 #récupère l'url de la base de donné à partir de la file .env
@@ -23,7 +22,7 @@ db_url = os.getenv('DATABASE_URL')
 engine = create_async_engine(db_url)
 
 meta = MetaData()
-AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession)
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
     async with engine.begin() as conn:
