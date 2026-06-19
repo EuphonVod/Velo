@@ -2988,6 +2988,104 @@ class MentionPopup(QListWidget):
         if self.count() > 0:
             self.setCurrentRow(0)
 
+import sqlite3 as _sqlite3
+import json as _json
+import time as _time
+
+
+class LocalCache:
+    """Cache local (SQLite) des historiques de conversation.
+    Entièrement fail-safe : la moindre erreur => on retombe sur le réseau,
+    rien ne casse côté app."""
+    def __init__(self, user_id):
+        self.ok = False
+        self.conn = None
+        try:
+            base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            folder = os.path.join(base, "Velo")
+            os.makedirs(folder, exist_ok=True)
+            self.conn = _sqlite3.connect(
+                os.path.join(folder, f"cache_{user_id}.db"),
+                check_same_thread=False)
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS dm (uid INTEGER PRIMARY KEY, payload TEXT, updated REAL)")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS grp (gid INTEGER PRIMARY KEY, payload TEXT, updated REAL)")
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, payload TEXT, updated REAL)")
+            self.conn.commit()
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def _get(self, table, col, key):
+        if not self.ok or key is None:
+            return None
+        try:
+            cur = self.conn.execute(f"SELECT payload FROM {table} WHERE {col}=?", (key,))
+            row = cur.fetchone()
+            return _json.loads(row[0]) if row else None
+        except Exception:
+            return None
+
+    def _put(self, table, col, key, msgs):
+        if not self.ok or key is None:
+            return
+        try:
+            payload = _json.dumps(msgs[-500:] if isinstance(msgs, list) else msgs)
+            self.conn.execute(
+                f"INSERT OR REPLACE INTO {table} ({col}, payload, updated) VALUES (?,?,?)",
+                (key, payload, _time.time()))
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def get_dm(self, uid):
+        return self._get("dm", "uid", uid)
+
+    def put_dm(self, uid, msgs):
+        self._put("dm", "uid", uid, msgs)
+
+    def get_group(self, gid):
+        return self._get("grp", "gid", gid)
+
+    def put_group(self, gid, msgs):
+        self._put("grp", "gid", gid, msgs)
+
+    def _get_kv(self, key):
+        if not self.ok:
+            return None
+        try:
+            cur = self.conn.execute("SELECT payload FROM kv WHERE k=?", (key,))
+            row = cur.fetchone()
+            return _json.loads(row[0]) if row else None
+        except Exception:
+            return None
+
+    def _put_kv(self, key, data):
+        if not self.ok:
+            return
+        try:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO kv (k, payload, updated) VALUES (?,?,?)",
+                (key, _json.dumps(data), _time.time()))
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def get_friends(self):
+        return self._get_kv("friends")
+
+    def put_friends(self, friends):
+        self._put_kv("friends", friends)
+
+    def get_groups(self):
+        return self._get_kv("groups")
+
+    def put_groups(self, groups):
+        self._put_kv("groups", groups)
+
+
 class VeloApp(QMainWindow):
     sig_msg = pyqtSignal(str, int)
     sig_group_msg = pyqtSignal(str)
@@ -3002,6 +3100,7 @@ class VeloApp(QMainWindow):
         super().__init__()
         self.token = token
         self.user = user
+        self._cache = LocalCache(user.get("id") if isinstance(user, dict) else None)
         self._splash = splash
         self._loaded_flags = {"friends": False, "groups": False}
         self.recv_id = None
@@ -3558,10 +3657,20 @@ class VeloApp(QMainWindow):
         while self.msg_vbox.count() > 1:
             it = self.msg_vbox.takeAt(0)
             if it.widget(): it.widget().deleteLater()
+        # Affiche immédiatement depuis le cache local (si dispo), puis rafraîchit
+        cached = self._cache.get_group(gid)
+        if cached:
+            self._fill_group_history(cached, gid)
         # Charge infos + historique en async
         self._async(api_get, lambda g: self._fill_group_header(g), f"/groups/{gid}", self.token)
-        self._async(api_get, lambda m: self._fill_group_history(m, gid), f"/groups/{gid}/history", self.token)
+        self._async(api_get, lambda m: self._on_group_history(m, gid), f"/groups/{gid}/history", self.token)
         self._connect_group_ws(gid)
+
+    def _on_group_history(self, msgs, gid):
+        if msgs is None or gid != self.current_group_id:
+            return
+        self._cache.put_group(gid, msgs)
+        self._fill_group_history(msgs, gid)
 
     def _fill_group_header(self, g):
         if not g: return
@@ -3571,26 +3680,36 @@ class VeloApp(QMainWindow):
         self.ch_sub.setText(lock)
 
     def _fill_group_history(self, msgs, gid):
+        if msgs is None or gid != self.current_group_id: return
         self._bubbles.clear()
-        prev_sender = None
-        for i, m in enumerate(msgs):
-            outgoing = m["sender_id"] == self.user["id"]
-            content = m["content"]
-            if content.startswith("[FILE]"):
-                w = self._parse_attachment(content, outgoing)
-                if w: self.msg_vbox.insertWidget(i, w)
-                prev_sender = None  # une pièce jointe casse le regroupement
-            else:
-                # Regroupement : masque avatar+nom si même expéditeur que le précédent
-                same_as_prev = (m["sender_id"] == prev_sender)
-                sender = None if (outgoing or same_as_prev) else m.get("sender_name", "?")
-                # indent : réserve l'espace avatar pour aligner les messages groupés
-                indent = (not outgoing) and same_as_prev
-                b = self._make_group_bubble(content, outgoing, gid,
-                                            msg_id=m.get("id"), edited=m.get("edited", False),
-                                            raw_content=content, sender_name=sender, indent=indent)
-                self.msg_vbox.insertWidget(i, b)
-                prev_sender = m["sender_id"]
+        cont = self.msg_vbox.parentWidget()
+        if cont is not None: cont.setUpdatesEnabled(False)
+        try:
+            # Vide la zone (rend le rendu idempotent : cache puis réseau)
+            while self.msg_vbox.count() > 1:
+                it = self.msg_vbox.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+            prev_sender = None
+            for i, m in enumerate(msgs):
+                outgoing = m["sender_id"] == self.user["id"]
+                content = m["content"]
+                if content.startswith("[FILE]"):
+                    w = self._parse_attachment(content, outgoing)
+                    if w: self.msg_vbox.insertWidget(i, w)
+                    prev_sender = None  # une pièce jointe casse le regroupement
+                else:
+                    # Regroupement : masque avatar+nom si même expéditeur que le précédent
+                    same_as_prev = (m["sender_id"] == prev_sender)
+                    sender = None if (outgoing or same_as_prev) else m.get("sender_name", "?")
+                    # indent : réserve l'espace avatar pour aligner les messages groupés
+                    indent = (not outgoing) and same_as_prev
+                    b = self._make_group_bubble(content, outgoing, gid,
+                                                msg_id=m.get("id"), edited=m.get("edited", False),
+                                                raw_content=content, sender_name=sender, indent=indent)
+                    self.msg_vbox.insertWidget(i, b)
+                    prev_sender = m["sender_id"]
+        finally:
+            if cont is not None: cont.setUpdatesEnabled(True)
         self._scroll_bottom()
 
     def _make_group_bubble(self, text, outgoing, gid, msg_id=None, edited=False,
@@ -3635,13 +3754,26 @@ class VeloApp(QMainWindow):
                 pass
 
     def _load_groups(self):
-        self._async(api_get, self._fill_groups, "/groups/my", self.token)
+        # Rendu instantané depuis le cache au tout premier chargement (barre vide)
+        if not self.groups:
+            cached = self._cache.get_groups()
+            if cached:
+                self._fill_groups(cached)
+        self._async(api_get, self._on_groups, "/groups/my", self.token)
 
-    def _fill_groups(self, groups):
+    def _on_groups(self, groups):
         if groups is None:
             # Échec réseau : on marque quand même pour ne pas bloquer le splash
             self._loaded_flags["groups"] = True
             self._maybe_close_splash()
+            return
+        self._cache.put_groups(groups)
+        self._fill_groups(groups)
+        self._loaded_flags["groups"] = True
+        self._maybe_close_splash()
+
+    def _fill_groups(self, groups):
+        if groups is None:
             return
         # Supprime les anciennes GroupRow
         for gid, row in list(self.groups.items()):
@@ -3658,8 +3790,6 @@ class VeloApp(QMainWindow):
             if g["id"] in hidden:
                 row.setVisible(False)
             pos += 1
-        self._loaded_flags["groups"] = True
-        self._maybe_close_splash()
 
     def _create_group(self):
         d = CreateGroupDialog(self.token, self)
@@ -3694,10 +3824,17 @@ class VeloApp(QMainWindow):
             return
         self._async(api_get, self._apply_friends_refresh, "/friends/list", self.token)
         self._async(api_get, self._apply_badge, "/friends/requests", self.token)
-        self._async(api_get, self._fill_groups, "/groups/my", self.token)
+        self._async(api_get, self._refresh_groups, "/groups/my", self.token)
+
+    def _refresh_groups(self, groups):
+        if groups is None:
+            return
+        self._cache.put_groups(groups)
+        self._fill_groups(groups)
 
     def _apply_friends_refresh(self, friends):
         if friends is None: return
+        self._cache.put_friends(friends)
         new_ids = {u["id"] for u in friends}
         existing_ids = set(self.friends.keys())
         if new_ids != existing_ids:
@@ -3934,7 +4071,23 @@ class VeloApp(QMainWindow):
 
     # ── Friends ───────────────────────────────────────────
     def _load_friends(self):
-        self._async(api_get, lambda f: self._load_friends_from_data(f) if f else None, "/friends/list", self.token)
+        # Rendu instantané depuis le cache au tout premier chargement (barre vide)
+        if not self.friends:
+            cached = self._cache.get_friends()
+            if cached:
+                self._load_friends_from_data(cached)
+        self._async(api_get, self._on_friends, "/friends/list", self.token)
+
+    def _on_friends(self, friends):
+        if friends is None:
+            # Échec réseau : on marque quand même pour ne pas bloquer le splash
+            self._loaded_flags["friends"] = True
+            self._maybe_close_splash()
+            return
+        self._cache.put_friends(friends)
+        self._load_friends_from_data(friends)
+        self._loaded_flags["friends"] = True
+        self._maybe_close_splash()
 
     def _filter_sidebar(self, text):
         q = text.strip().lower()
@@ -4042,8 +4195,6 @@ class VeloApp(QMainWindow):
             if u["id"] in hidden:
                 row.setVisible(False)
             pos += 1
-        self._loaded_flags["friends"] = True
-        self._maybe_close_splash()
 
     def _maybe_close_splash(self):
         # Ferme le splash quand amis ET groupes sont chargés
@@ -4118,9 +4269,20 @@ class VeloApp(QMainWindow):
         while self.msg_vbox.count() > 1:
             it = self.msg_vbox.takeAt(0)
             if it.widget(): it.widget().deleteLater()
+        # Affiche immédiatement depuis le cache local (si dispo), puis rafraîchit
+        cached = self._cache.get_dm(uid)
+        if cached:
+            self._fill_history(cached, uid)
         # Charge le profil et l'historique en arrière-plan
         self._async(api_get, lambda u: self._fill_header(u, uid), f"/auth/users/{uid}", self.token)
-        self._async(api_get, lambda m: self._fill_history(m, uid), f"/chat/conversation/{uid}", self.token)
+        self._async(api_get, lambda m: self._on_dm_history(m, uid), f"/chat/conversation/{uid}", self.token)
+
+    def _on_dm_history(self, msgs, uid):
+        # Réseau arrivé : on met à jour le cache puis on re-rend (remplace le cache affiché)
+        if msgs is None or uid != self.recv_id:
+            return
+        self._cache.put_dm(uid, msgs)
+        self._fill_history(msgs, uid)
 
     def _fill_header(self, u, uid):
         if not u or uid != self.recv_id: return
@@ -4191,31 +4353,40 @@ class VeloApp(QMainWindow):
     def _fill_history(self, msgs, uid):
         if msgs is None or uid != self.recv_id: return
         self._bubbles.clear()
-        pos = 0  # position d'insertion (avant le stretch final)
-        prev_date = None
-        for m in msgs:
-            content = m["content"]
-            outgoing = m["sender_id"] == self.user["id"]
-            # Séparateur de date si le jour change
-            created = m.get("created_at")
-            if created:
-                dlabel = format_date_label(created)
-                if dlabel and dlabel != prev_date:
-                    self.msg_vbox.insertWidget(pos, make_date_separator(dlabel))
-                    pos += 1
-                    prev_date = dlabel
-            if content.startswith("[GROUP_INVITE]"):
-                gid = int(content.replace("[GROUP_INVITE]", ""))
-                card = InviteCard(self.token, self.user, gid)
-                card.joined.connect(self._load_groups)
-                self.msg_vbox.insertWidget(pos, card)
-            elif content.startswith("[FILE]"):
-                w = self._parse_attachment(content, outgoing)
-                if w: self.msg_vbox.insertWidget(pos, w)
-            else:
-                self.msg_vbox.insertWidget(pos, self._make_bubble(
-                    content, outgoing, msg_id=m.get("id"), edited=m.get("edited", False)))
-            pos += 1
+        cont = self.msg_vbox.parentWidget()
+        if cont is not None: cont.setUpdatesEnabled(False)
+        try:
+            # Vide la zone (rend le rendu idempotent : cache puis réseau)
+            while self.msg_vbox.count() > 1:
+                it = self.msg_vbox.takeAt(0)
+                if it.widget(): it.widget().deleteLater()
+            pos = 0  # position d'insertion (avant le stretch final)
+            prev_date = None
+            for m in msgs:
+                content = m["content"]
+                outgoing = m["sender_id"] == self.user["id"]
+                # Séparateur de date si le jour change
+                created = m.get("created_at")
+                if created:
+                    dlabel = format_date_label(created)
+                    if dlabel and dlabel != prev_date:
+                        self.msg_vbox.insertWidget(pos, make_date_separator(dlabel))
+                        pos += 1
+                        prev_date = dlabel
+                if content.startswith("[GROUP_INVITE]"):
+                    gid = int(content.replace("[GROUP_INVITE]", ""))
+                    card = InviteCard(self.token, self.user, gid)
+                    card.joined.connect(self._load_groups)
+                    self.msg_vbox.insertWidget(pos, card)
+                elif content.startswith("[FILE]"):
+                    w = self._parse_attachment(content, outgoing)
+                    if w: self.msg_vbox.insertWidget(pos, w)
+                else:
+                    self.msg_vbox.insertWidget(pos, self._make_bubble(
+                        content, outgoing, msg_id=m.get("id"), edited=m.get("edited", False)))
+                pos += 1
+        finally:
+            if cont is not None: cont.setUpdatesEnabled(True)
         self._scroll_bottom()
 
     #websocket
@@ -4562,14 +4733,23 @@ if __name__ == "__main__":
         _RELOGIN = False
         token = None
         user = None
+        splash = None
         if _try_auto:
             _try_auto = False
             saved = load_saved_token()
             if saved:
+                # On affiche le splash AVANT l'appel réseau : la fenêtre apparaît
+                # immédiatement, même si le serveur (Render) doit se réveiller.
+                splash = SplashScreen()
+                splash.show()
+                app.processEvents()
                 me = api_get("/auth/me", saved)
                 if me:  # token encore valide
                     token = saved
                     user = me
+                else:
+                    splash.stop()
+                    splash = None
         # Si pas d'auto-login réussi, on affiche l'écran de connexion
         if token is None:
             login = LoginDialog()
@@ -4577,10 +4757,11 @@ if __name__ == "__main__":
                 break
             token = login.token
             user = login.user
-        # Écran de chargement pendant la construction de l'app
-        splash = SplashScreen()
-        splash.show()
-        app.processEvents()  # affiche le splash immédiatement
+        # Écran de chargement pendant la construction de l'app (réutilise celui du boot si présent)
+        if splash is None:
+            splash = SplashScreen()
+            splash.show()
+            app.processEvents()  # affiche le splash immédiatement
         win = VeloApp(token, user, splash=splash)
         win.show()
         # Le splash se ferme tout seul quand les données sont chargées

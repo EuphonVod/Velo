@@ -9,6 +9,10 @@ from app.routers.conversation import router as conversation_router
 from app.routers.calls import router as calls_router
 from app.routers import admin
 
+from slowapi.errors import RateLimitExceeded
+from slowapi import _rate_limit_exceeded_handler
+from app.limiter import limiter
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -20,9 +24,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Rate limiting (anti-bruteforce / anti-spam SMS)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 
 @app.get("/")
 async def root():
+    return {"status": "ok"}
+
+@app.get("/health")
+async def health():
     return {"status": "ok"}
 
 

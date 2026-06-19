@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
 from app.dependencies import get_current_user
 from app.codes import create_code, verify_code
+from app.limiter import limiter
 from app.models.user import User, GlobalBannedIP
 from app.models.moderation import Warnings
 from app.schemas.user import (
@@ -55,6 +56,7 @@ def _make_token(user_id: int) -> str:
 
 # ── Connexion par téléphone + code ─────────────────────────
 @router.post("/request_code")
+@limiter.limit("5/minute;20/hour")
 async def request_code(data: PhoneRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Étape 1 : l'utilisateur saisit son numéro, on lui envoie un code."""
     phone = _normalize_phone(data.phone)
@@ -69,6 +71,7 @@ async def request_code(data: PhoneRequest, request: Request, db: AsyncSession = 
 
 
 @router.post("/verify_code", response_model=Token)
+@limiter.limit("10/minute;60/hour")
 async def verify_code_route(data: CodeVerify, request: Request, db: AsyncSession = Depends(get_db)):
     """Étape 2 : vérifie le code. Crée le compte si le numéro est nouveau."""
     phone = _normalize_phone(data.phone)
@@ -96,8 +99,10 @@ async def verify_code_route(data: CodeVerify, request: Request, db: AsyncSession
 
 
 @router.post("/request_action_code")
+@limiter.limit("5/minute;20/hour")
 async def request_action_code(
     data: ActionCodeRequest,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):

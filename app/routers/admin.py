@@ -15,6 +15,7 @@ from app.models.user import User, GlobalBannedIP
 from app.routers.auth import get_current_user, _make_token
 from datetime import datetime
 from app.models.moderation import Warnings
+from limiter import limiter
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -547,8 +548,10 @@ class AdminPasswordLogin(BaseModel):
 
 
 @router.post("/login")
+@limiter.limit("5/minute;20/hour")
 async def admin_password_login(
     data: AdminPasswordLogin,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     expected = os.getenv("ADMIN_PASSWORD", "")

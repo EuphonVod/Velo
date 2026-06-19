@@ -12,6 +12,9 @@ from app.models.group import Group, GroupMember, GroupMessage, GroupInvite
 from app.models.group import Group, GroupMember, GroupMessage, GroupInvite, GroupBan
 from app.models.conversation import ConversationSettings
 from app.models.verification import PhoneCode
+from app.models.moderation import Warnings, Report, AdminNote
+from app.models.audit import AuditLog
+
 
 #load la file en .env
 load_dotenv()

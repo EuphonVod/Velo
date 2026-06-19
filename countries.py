@@ -37,6 +37,9 @@ COUNTRIES = [
     ("Vietnam", "VN", "84"),
 ]
 
+# Pré-trié une seule fois (évite de re-trier à chaque ouverture du login)
+SORTED_COUNTRIES = sorted(COUNTRIES, key=lambda c: c[0])
+
 
 import os
 import sys
@@ -82,6 +85,8 @@ def make_country_combo(default_iso="FR"):
         def showPopup(self):
             super().showPopup()
             popup = self.view().window()
+            if popup is None:
+                return
             below = self.mapToGlobal(QPoint(0, self.height()))
             win = self.window()
             win_bottom = win.mapToGlobal(QPoint(0, win.height())).y()
@@ -93,7 +98,7 @@ def make_country_combo(default_iso="FR"):
     combo.setIconSize(QSize(22, 16))
     combo.setMaxVisibleItems(8)
     default_idx = 0
-    for i, (name, iso, dial) in enumerate(sorted(COUNTRIES, key=lambda c: c[0])):
+    for i, (name, iso, dial) in enumerate(SORTED_COUNTRIES):
         combo.addItem(
             flag_icon(iso),
             f"{name}   +{dial}",
