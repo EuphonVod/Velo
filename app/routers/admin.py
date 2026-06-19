@@ -16,6 +16,8 @@ from app.routers.auth import get_current_user, _make_token
 from datetime import datetime
 from app.models.moderation import Warnings
 from limiter import limiter
+from app.audit import record
+from app.models.audit import AuditLog
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -55,9 +57,11 @@ async def admin_delete_user(
         raise HTTPException(404, "User not found")
     if target.is_superuser:
         raise HTTPException(403, "Cannot delete another admin")
+    tid, tname = target.id, target.username
     await _purge_user(db, target.id)
     await db.delete(target)
     await db.commit()
+    await record(db, current_user.id, "delete_user", tid, f"username={tname}")
     return {"status": "deleted"}
 
 
@@ -74,6 +78,7 @@ async def admin_ban_user(
         raise HTTPException(404, "User not found")
     if target.is_superuser:
         raise HTTPException(403, "Cannot ban another admin")
+    tid, tname, tip = target.id, target.username, target.ip
     if target.ip:
         ex = await db.execute(
             select(GlobalBannedIP).where(GlobalBannedIP.ip == target.ip))
@@ -82,6 +87,7 @@ async def admin_ban_user(
     await _purge_user(db, target.id)
     await db.delete(target)
     await db.commit()
+    await record(db, current_user.id, "ban_user", tid, f"username={tname} ip={tip or ''}")
     return {"status": "banned"}
 
 
@@ -171,8 +177,10 @@ async def admin_delete_group(
     await db.execute(delete(GroupBan).where(GroupBan.group_id == gid))
     await db.execute(delete(GroupInvite).where(GroupInvite.group_id == gid))
     await db.execute(delete(GroupBannedIP).where(GroupBannedIP.group_id == gid))
+    gname = g.name
     await db.delete(g)
     await db.commit()
+    await record(db, current_user.id, "delete_group", gid, f"name={gname}")
     return {"status": "deleted"}
 
 @router.get("/group_members")
@@ -257,6 +265,7 @@ async def admin_unban_ip(
     _require_admin(current_user)
     await db.execute(delete(GlobalBannedIP).where(GlobalBannedIP.ip == data.ip))
     await db.commit()
+    await record(db, current_user.id, "unban_ip", None, f"ip={data.ip}")
     return {"status": "unbanned"}
 
 class SetAdmin(BaseModel):
@@ -276,6 +285,8 @@ async def admin_set_admin(
         raise HTTPException(404, "User not found")
     target.is_superuser = data.make_admin
     await db.commit()
+    await record(db, current_user.id, "set_admin", data.user_id,
+                 f"make_admin={data.make_admin}")
     return {"status": "ok", "is_superuser": target.is_superuser}
 
 @router.get("/user_messages")
@@ -361,6 +372,7 @@ async def admin_delete_message(
     else:
         await db.execute(delete(GroupMessage).where(GroupMessage.id == data.msg_id))
     await db.commit()
+    await record(db, current_user.id, "delete_message", data.msg_id, f"kind={data.kind}")
     return {"status": "deleted"}
 
 class CreateReport(BaseModel):
@@ -412,7 +424,10 @@ async def admin_resolve_report(
     r = res.scalar_one_or_none()
     if r:
         r.status = "resolved"
+        reported_id = r.reported_user_id
         await db.commit()
+        await record(db, current_user.id, "resolve_report", data.report_id,
+                     f"reported_id={reported_id}")
     return {"status": "ok"}
 
 @router.get("/group_bans")
@@ -454,6 +469,7 @@ async def admin_group_unban(
     else:
         await db.execute(delete(GroupBannedIP).where(GroupBannedIP.id == data.ban_id))
     await db.commit()
+    await record(db, current_user.id, "group_unban", data.ban_id, f"kind={data.kind}")
     return {"status": "ok"}
 
 class AddNote(BaseModel):
@@ -483,6 +499,7 @@ async def admin_add_note(
     _require_admin(current_user)
     db.add(AdminNote(user_id=data.user_id, note=data.note))
     await db.commit()
+    await record(db, current_user.id, "add_note", data.user_id, "")
     return {"status": "ok"}
 
 class NoteAction(BaseModel):
@@ -497,6 +514,7 @@ async def admin_delete_note(
     _require_admin(current_user)
     await db.execute(delete(AdminNote).where(AdminNote.id == data.note_id))
     await db.commit()
+    await record(db, current_user.id, "delete_note", data.note_id, "")
     return {"status": "ok"}
 
 class AddWarning(BaseModel):
@@ -513,6 +531,8 @@ async def admin_add_warning(
     _require_admin(current_user)
     db.add(Warnings(user_id=data.user_id, reason=data.reason, severity=data.severity))
     await db.commit()
+    await record(db, current_user.id, "add_warning", data.user_id,
+                 f"severity={data.severity} reason={data.reason}")
     return {"status": "ok"}
 
 @router.get("/warnings")
@@ -541,6 +561,7 @@ async def admin_delete_warning(
     _require_admin(current_user)
     await db.execute(delete(Warnings).where(Warnings.id == data.warning_id))
     await db.commit()
+    await record(db, current_user.id, "delete_warning", data.warning_id, "")
     return {"status": "ok"}
 
 class AdminPasswordLogin(BaseModel):
@@ -562,6 +583,9 @@ async def admin_password_login(
     admin = res.scalars().first()
     if admin is None:
         raise HTTPException(status_code=404, detail="No admin account configured")
+    fwd = request.headers.get("x-forwarded-for")
+    ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "")
+    await record(db, admin.id, "admin_login", admin.id, f"ip={ip}")
     return {
         "access_token": _make_token(admin.id),
         "user": {
@@ -571,3 +595,41 @@ async def admin_password_login(
             "phone": admin.phone or "",
         },
     }
+
+
+@router.get("/audit")
+async def admin_audit(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    action: str | None = None,
+    actor_id: int | None = None,
+    limit: int = 200,
+):
+    """Journal d'audit : actions admin récentes (filtrable par action / admin)."""
+    _require_admin(current_user)
+    q = select(AuditLog).order_by(AuditLog.created_at.desc())
+    if action:
+        q = q.where(AuditLog.action == action)
+    if actor_id:
+        q = q.where(AuditLog.actor_id == actor_id)
+    q = q.limit(min(max(limit, 1), 500))
+    res = await db.execute(q)
+    rows = res.scalars().all()
+    # Résout les noms d'admins en une requête
+    ids = {r.actor_id for r in rows}
+    names = {}
+    if ids:
+        ures = await db.execute(select(User).where(User.id.in_(ids)))
+        names = {u.id: u.username for u in ures.scalars().all()}
+    return [
+        {
+            "id": r.id,
+            "actor_id": r.actor_id,
+            "actor": names.get(r.actor_id, f"#{r.actor_id}"),
+            "action": r.action,
+            "target_id": r.target_id,
+            "details": r.details or "",
+            "at": r.created_at.isoformat() if r.created_at else "",
+        }
+        for r in rows
+    ]
